@@ -1,0 +1,25 @@
+version: "3.7"
+
+services:
+
+  previsions_conso:
+    restart: always
+    build:
+      context: ./build/previsions_conso
+    container_name: previsions_conso
+    networks:
+      kafka_lan:
+        aliases:
+          - previsions_conso
+    volumes:
+      - /home/docker_volumes/previsions_conso/log:/usr/local/src/previsions_conso/logs
+
+#################################################
+# Network initialized by zookeeper and used by
+# the whole "kafka-ecosystem": zookeeper,
+# kafka, (+ schema-registry & connect when needed
+#################################################
+networks:
+  kafka_lan:
+    external:
+      name: docker-kafka-single_kafka_lan

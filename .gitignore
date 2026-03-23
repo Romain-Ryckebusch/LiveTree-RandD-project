@@ -1,0 +1,52 @@
+# Data files
+*.csv
+*.parquet
+*.xlsx
+*.xls
+*.xml
+
+# Machine learning models & scalers
+*.h5
+*.save
+*.joblib
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# LibreOffice lock files
+.~lock.*
+
+# Security / secrets
+*.pem
+*.key
+*.secu
+ca-cert
+.env
+
+# Docker
+*.log
+
+# Office documents
+*.docx
