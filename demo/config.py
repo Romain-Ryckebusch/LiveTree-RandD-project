@@ -5,15 +5,21 @@ import os
 
 # --- Paths ---
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.path.join(PROJECT_ROOT, "phase-2", "Data")
-MODEL_DIR = os.path.join(
-    PROJECT_ROOT,
-    "phase-2",
-    "Prediction Model",
-    "docker-previsions-conso",
-    "build",
-    "previsions_conso",
-    "code",
+DATA_DIR = os.environ.get(
+    "DEMO_DATA_DIR",
+    os.path.join(PROJECT_ROOT, "phase-2", "Data"),
+)
+MODEL_DIR = os.environ.get(
+    "DEMO_MODEL_DIR",
+    os.path.join(
+        PROJECT_ROOT,
+        "phase-2",
+        "Prediction Model",
+        "docker-previsions-conso",
+        "build",
+        "previsions_conso",
+        "code",
+    ),
 )
 
 HISTORICAL_CSV = os.path.join(DATA_DIR, "2026 historical data.csv")
@@ -38,3 +44,9 @@ FREQ = "10min"
 
 # --- Timezone ---
 TIMEZONE = "Europe/Paris"
+
+# --- Output ---
+OUTPUT_DIR = os.environ.get(
+    "DEMO_OUTPUT_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "output"),
+)

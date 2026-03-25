@@ -1,0 +1,10 @@
+[
+  {"label": "1h_1block", "gap_mode": "blocks", "block_length": 6, "n_blocks": 1},
+  {"label": "6h_1block", "gap_mode": "blocks", "block_length": 36, "n_blocks": 1},
+  {"label": "6h_2blocks", "gap_mode": "blocks", "block_length": 36, "n_blocks": 2},
+  {"label": "12h_1block", "gap_mode": "blocks", "block_length": 72, "n_blocks": 1},
+  {"label": "24h_1block", "gap_mode": "blocks", "block_length": 144, "n_blocks": 1},
+  {"label": "48h_1block", "gap_mode": "blocks", "block_length": 288, "n_blocks": 1},
+  {"label": "random_50", "gap_mode": "random", "n_points": 50},
+  {"label": "random_200", "gap_mode": "random", "n_points": 200}
+]
