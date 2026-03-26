@@ -1,4 +1,4 @@
-FROM python:3.7-slim-buster
+FROM python:3.7-slim-bookworm
 
 # System dependencies (h5py / scipy may need compilation)
 RUN apt-get update && \

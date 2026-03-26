@@ -213,6 +213,7 @@ def run(args, hist_df=None, weather_df=None, quiet=False):
     imputed_series, quality = impute(
         history_gapped[BUILDING_COLUMN],
         history_gapped["Date"],
+        random_seed=args.seed,
     )
     history_imputed = history_gapped.copy()
     history_imputed[BUILDING_COLUMN] = imputed_series.values
@@ -222,7 +223,7 @@ def run(args, hist_df=None, weather_df=None, quiet=False):
     remaining_nan = np.isnan(history_imputed_values).sum()
     log(f"Remaining NaN after imputation: {remaining_nan}")
     log("Quality flag distribution:")
-    for flag, flag_label in [(0, "real"), (1, "linear"), (2, "seasonal"), (3, "backup")]:
+    for flag, flag_label in [(0, "real"), (1, "linear"), (2, "contextual"), (3, "donor-day")]:
         count = (quality_values == flag).sum()
         if count > 0:
             log(f"  {flag} ({flag_label}): {count}")

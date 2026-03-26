@@ -1,0 +1,20 @@
+[
+  {
+    "scenario_label": "blocks_144x2",
+    "target_date": "2026-02-01",
+    "gap_mode": "blocks",
+    "block_length": 144,
+    "n_blocks": 2,
+    "n_points": 50,
+    "seed": 42,
+    "bvi_mae": 4477.064453125,
+    "bvi_rmse": 8493.8427734375,
+    "bvi_mape": 12.177329510450363,
+    "bva_mae": 7446.177151150174,
+    "bva_rmse": 8555.914303731264,
+    "bva_mape": 16.999431331471882,
+    "iva_mae": 7563.303792317708,
+    "iva_rmse": 8765.748928961655,
+    "iva_mape": 17.243257845344445
+  }
+]

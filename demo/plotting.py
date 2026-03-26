@@ -23,8 +23,8 @@ from config import BUILDING_COLUMN
 QUALITY_COLORS = {
     0: ("white", "Real data"),
     1: ("#fee08b", "Linear interpolation"),
-    2: ("#fdae61", "Seasonal interpolation"),
-    3: ("#d73027", "Backup injection"),
+    2: ("#fdae61", "Contextual reconstruction"),
+    3: ("#d73027", "Donor-day reconstruction"),
 }
 
 
