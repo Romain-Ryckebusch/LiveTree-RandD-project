@@ -11,6 +11,9 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+EDGE_SCALE_MIN = 0.1
+EDGE_SCALE_MAX = 10.0
+
 
 # ====================
 # Logging setup
@@ -433,6 +436,49 @@ def estimate_scale_for_gap(
     return scale
 
 
+def apply_edge_continuity(
+    gap_values: np.ndarray,
+    prev_value: Optional[float],
+    next_value: Optional[float],
+    *,
+    edge_scale_min: float = EDGE_SCALE_MIN,
+    edge_scale_max: float = EDGE_SCALE_MAX,
+) -> np.ndarray:
+    """
+    Multiplicatively rescale a reconstructed gap so its two edges remain
+    continuous with the nearest observed samples.
+
+    This is mainly a guardrail for short-history reconstructions where a coarse
+    fallback profile can have the right class but the wrong level (for example a
+    Saturday-like weekend profile used inside a Sunday block).
+    """
+    adjusted = np.asarray(gap_values, dtype=float).copy()
+    if adjusted.size == 0:
+        return adjusted
+
+    eps = 1e-9
+    start_scale = None
+    end_scale = None
+
+    if prev_value is not None and np.isfinite(prev_value) and abs(adjusted[0]) > eps:
+        start_scale = float(np.clip(prev_value / adjusted[0], edge_scale_min, edge_scale_max))
+
+    if next_value is not None and np.isfinite(next_value) and abs(adjusted[-1]) > eps:
+        end_scale = float(np.clip(next_value / adjusted[-1], edge_scale_min, edge_scale_max))
+
+    if start_scale is None and end_scale is None:
+        return adjusted
+    if start_scale is None:
+        start_scale = end_scale
+    if end_scale is None:
+        end_scale = start_scale
+
+    ramp = np.linspace(start_scale, end_scale, adjusted.size)
+    adjusted *= ramp
+    adjusted[adjusted < 0] = 0.0
+    return adjusted
+
+
 # ================================
 # 6. Imputation for a single series
 # ================================
@@ -674,6 +720,14 @@ def impute_series_with_profiles(
 
                     values[i] = max(v, 0.0)
 
+            prev_value = values[prev_idx] if prev_idx is not None else None
+            next_value = values[next_idx] if next_idx is not None else None
+            values[start: end + 1] = apply_edge_continuity(
+                values[start: end + 1],
+                prev_value=prev_value,
+                next_value=next_value,
+            )
+
             continue  # skip medium-gap branch for this gap
 
 
@@ -698,6 +752,14 @@ def impute_series_with_profiles(
                 v *= noise
 
             values[i] = max(v, 0.0)
+
+        prev_value = values[prev_idx] if prev_idx is not None else None
+        next_value = values[next_idx] if next_idx is not None else None
+        values[start: end + 1] = apply_edge_continuity(
+            values[start: end + 1],
+            prev_value=prev_value,
+            next_value=next_value,
+        )
 
     logger.info("Column %s: imputation completed.", col)
     return pd.Series(values, index=series.index, name=series.name)

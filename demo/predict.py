@@ -91,7 +91,7 @@ def predict_day(target_timestamps, weather_temps, history_df):
 
     Returns
     -------
-    np.ndarray of shape (144,) -- predicted power in watts
+    np.ndarray of shape (144,),predicted power in watts
     """
     entr = _build_feature_matrix(target_timestamps, weather_temps, history_df)
 

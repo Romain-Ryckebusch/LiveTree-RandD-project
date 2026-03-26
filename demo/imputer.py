@@ -32,6 +32,8 @@ SCALE_MIN = 0.5
 SCALE_MAX = 2.0
 REL_NOISE = 0.03
 MAX_CONTEXT_POINTS = 144
+EDGE_SCALE_MIN = 0.1
+EDGE_SCALE_MAX = 10.0
 
 
 # ====================
@@ -301,6 +303,51 @@ def _estimate_scale_for_gap(
     return max(scale_min, min(scale_max, scale))
 
 
+def _apply_edge_continuity(
+    gap_values: np.ndarray,
+    prev_value: Optional[float],
+    next_value: Optional[float],
+    *,
+    edge_scale_min: float = EDGE_SCALE_MIN,
+    edge_scale_max: float = EDGE_SCALE_MAX,
+) -> np.ndarray:
+    """
+    Multiplicatively rescale an already reconstructed gap so its two edges stay
+    continuous with the nearest observed points.
+
+    This fixes the main failure mode of the 7-day demo: a coarse contextual
+    fallback can pick a profile with the right broad category (for example
+    "weekend") but the wrong local level (for example Saturday-like instead of
+    Sunday-like). The gap shape is kept, but its scale is forced to agree with
+    the observations immediately before/after the block.
+    """
+    adjusted = np.asarray(gap_values, dtype=float).copy()
+    if adjusted.size == 0:
+        return adjusted
+
+    eps = 1e-9
+    start_scale = None
+    end_scale = None
+
+    if prev_value is not None and np.isfinite(prev_value) and abs(adjusted[0]) > eps:
+        start_scale = float(np.clip(prev_value / adjusted[0], edge_scale_min, edge_scale_max))
+
+    if next_value is not None and np.isfinite(next_value) and abs(adjusted[-1]) > eps:
+        end_scale = float(np.clip(next_value / adjusted[-1], edge_scale_min, edge_scale_max))
+
+    if start_scale is None and end_scale is None:
+        return adjusted
+    if start_scale is None:
+        start_scale = end_scale
+    if end_scale is None:
+        end_scale = start_scale
+
+    ramp = np.linspace(start_scale, end_scale, adjusted.size)
+    adjusted *= ramp
+    adjusted[adjusted < 0] = 0.0
+    return adjusted
+
+
 # ========================
 # Public demo entry point
 # ========================
@@ -471,6 +518,14 @@ def impute(
 
                     values[i] = max(v, 0.0)
 
+            prev_value = values[prev_idx] if prev_idx is not None else None
+            next_value = values[next_idx] if next_idx is not None else None
+            values[start : end + 1] = _apply_edge_continuity(
+                values[start : end + 1],
+                prev_value=prev_value,
+                next_value=next_value,
+            )
+
             quality_out.iloc[start : end + 1] = 3
             continue
 
@@ -489,6 +544,14 @@ def impute(
                 v *= noise
 
             values[i] = max(v, 0.0)
+
+        prev_value = values[prev_idx] if prev_idx is not None else None
+        next_value = values[next_idx] if next_idx is not None else None
+        values[start : end + 1] = _apply_edge_continuity(
+            values[start : end + 1],
+            prev_value=prev_value,
+            next_value=next_value,
+        )
 
         quality_out.iloc[start : end + 1] = 2
 

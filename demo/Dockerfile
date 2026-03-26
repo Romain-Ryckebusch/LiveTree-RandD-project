@@ -10,7 +10,7 @@ WORKDIR /app/demo
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Code is volume-mounted, not copied -- rebuild only when deps change
+# Code is volume-mounted, not copied,rebuild only when deps change
 RUN mkdir -p /app/demo/output
 
 ENV MPLBACKEND=Agg

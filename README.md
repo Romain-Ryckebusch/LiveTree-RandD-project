@@ -1,4 +1,4 @@
-# Project N28 -- Improving Predictive Model Resilience Through Data Quality and Continuity
+# Project N28,Improving Predictive Model Resilience Through Data Quality and Continuity
 
 JUNIA R&D project (LiveTree demonstrator). A neural network predicts daily energy consumption for instrumented buildings. This project adds a resilience layer ("Module de Pilotage") that fills data gaps so predictions keep running during multi-hour outages.
 
@@ -7,7 +7,7 @@ JUNIA R&D project (LiveTree demonstrator). A neural network predicts daily energ
 ```
 phase-1/                 Research phase: gap analysis, synthetic hole injection, literature review
 phase-2/
-  Data/                  CSV time series (consumption, weather, forecasts) -- not in git
+  Data/                  CSV time series (consumption, weather, forecasts),not in git
   Prediction Model/      Production prediction service (Docker + Keras + Kafka)
 demo/                    Single-building demo pipeline (current focus)
 .claude/                 Architecture docs, file index, conventions
@@ -33,7 +33,7 @@ Obtain these files from the project shared drive or from a team member.
 
 ## Demo Pipeline
 
-The demo validates the imputation + prediction pipeline on a single building (`Ptot_HA` -- Hotel Academique). It runs entirely on CSV files, no Kafka or Cassandra needed.
+The demo validates the imputation + prediction pipeline on a single building (`Ptot_HA`,Hotel Academique). It runs entirely on CSV files, no Kafka or Cassandra needed.
 
 **Pipeline flow:** Load CSV -> extract 7-day window -> inject synthetic gaps -> impute -> predict -> compare against no-gap baseline.
 
@@ -90,9 +90,9 @@ docker-compose run demo --target-date 2026-02-01 --save-plots --save-summary
 
 When `--save-plots` is used, each scenario produces three plots in `output/{date}_{label}/`:
 
-- **predictions.png** -- baseline vs imputed predictions (+ actual if available)
-- **history_gaps.png** -- 7-day history window with color-coded imputation regions
-- **metrics.png** -- bar chart of MAE, RMSE, MAPE
+- **predictions.png**,baseline vs imputed predictions (+ actual if available)
+- **history_gaps.png**,7-day history window with color-coded imputation regions
+- **metrics.png**,bar chart of MAE, RMSE, MAPE
 
 In multi-scenario mode, an additional **scenario_comparison.png** shows metric degradation across all gap configurations, and `--save-summary` writes a **summary.csv** for programmatic analysis.
 
@@ -119,9 +119,9 @@ A default `scenarios.json` is included with gap sizes from 1h to 48h.
 | MAPE | Mean Absolute Percentage Error (%) |
 
 Three comparisons are computed:
-- **baseline vs imputed** -- how much predictions degrade due to gap filling (primary metric)
-- **baseline vs actual** -- baseline model accuracy
-- **imputed vs actual** -- imputed model accuracy
+- **baseline vs imputed**,how much predictions degrade due to gap filling (primary metric)
+- **baseline vs actual**,baseline model accuracy
+- **imputed vs actual**,imputed model accuracy
 
 ## Imputation Strategy
 

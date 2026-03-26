@@ -61,7 +61,7 @@ def plot_predictions(result, output_dir):
 
     ax.set_xlabel("Time")
     ax.set_ylabel("Power (W)")
-    ax.set_title(f"Predictions for {result.target_date} -- {result.scenario_label}")
+    ax.set_title(f"Predictions for {result.target_date},{result.scenario_label}")
     ax.legend(loc="upper right")
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
     ax.grid(True, alpha=0.3)
@@ -138,7 +138,7 @@ def plot_history_gaps(result, output_dir):
 
     ax.set_xlabel("Date")
     ax.set_ylabel(f"{BUILDING_COLUMN} (W)")
-    ax.set_title(f"7-day history -- {result.scenario_label}")
+    ax.set_title(f"7-day history,{result.scenario_label}")
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%a %H:%M"))
     ax.grid(True, alpha=0.3)
     fig.autofmt_xdate()
@@ -197,7 +197,7 @@ def plot_metrics_bars(result, output_dir):
     ax2.set_title("MAPE")
     ax2.grid(True, alpha=0.3, axis="y")
 
-    fig.suptitle(f"Metrics -- {result.scenario_label}", fontsize=12)
+    fig.suptitle(f"Metrics,{result.scenario_label}", fontsize=12)
     fig.tight_layout()
 
     path = os.path.join(output_dir, "metrics.png")
