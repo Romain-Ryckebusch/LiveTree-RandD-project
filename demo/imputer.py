@@ -1,19 +1,19 @@
 """
 Contextual imputation module for the demo.
 
-This file now mirrors the actual algorithm from the reference Python scripts
-(`Algorithmic-simple-solution/contextual_impute.py`) instead of the earlier
-simplified demo-only cascade.
+All gap sizes use a cosine-blended mix of linear interpolation (strong at
+boundaries) and a contextual profile (growing in the centre).  The contextual
+contribution scales with gap length so short gaps are almost purely linear
+while long gaps benefit from daily-shape information.
 
 Gap handling:
-1. Small gaps (<= 3 points): linear interpolation when both neighbours exist.
-2. Medium gaps: contextual slot baselines scaled from surrounding observations.
-3. Long gaps (>= 144 points / 1 day): donor-day reconstruction + contextual
-   scaling + small stochastic noise.
+1. Medium gaps (< 144 points): contextual slot baselines, level-corrected to
+   match boundary-implied mean, blended with linear interpolation.
+2. Long gaps (>= 144 points / 1 day): multi-donor-day average, faded level
+   correction, blended with linear interpolation.
 
 Quality flags returned by ``impute``:
     0 = real/original value
-    1 = linear interpolation
     2 = contextual profile reconstruction
     3 = donor-day reconstruction
 """
@@ -26,14 +26,11 @@ import numpy as np
 import pandas as pd
 
 
-SMALL_GAP_MAX = 3
 LONG_GAP_MIN = 144
 SCALE_MIN = 0.5
 SCALE_MAX = 2.0
-REL_NOISE = 0.03
 MAX_CONTEXT_POINTS = 144
-EDGE_SCALE_MIN = 0.1
-EDGE_SCALE_MAX = 10.0
+MAX_DONOR_DAYS = 5
 
 
 # ====================
@@ -245,6 +242,40 @@ def _choose_donor_day(
     return None, None, None
 
 
+def _choose_donor_days(
+    library: Dict[Tuple[str, int, int], List[Dict[str, object]]],
+    day_type: str,
+    dow: int,
+    month: int,
+    max_donors: int = MAX_DONOR_DAYS,
+) -> Tuple[Optional[np.ndarray], Optional[str]]:
+    """Select up to *max_donors* similar days and return their averaged values.
+
+    Uses the same fallback hierarchy as ``_choose_donor_day`` but averages
+    multiple donors (most-recent first) to reduce variance.
+    """
+    levels = [
+        ("day_type+dow+month", lambda dt, d, m: dt == day_type and d == dow and m == month),
+        ("day_type+dow", lambda dt, d, m: dt == day_type and d == dow),
+        ("day_type", lambda dt, d, m: dt == day_type),
+        ("any", lambda dt, d, m: True),
+    ]
+    for level_name, match_fn in levels:
+        candidates: List[Dict[str, object]] = []
+        for (dt, d, m), arrs in library.items():
+            if match_fn(dt, d, m):
+                candidates.extend(arrs)
+        if not candidates:
+            continue
+        candidates.sort(key=lambda c: c["date"], reverse=True)
+        selected = candidates[: max_donors]
+        min_len = min(len(c["values"]) for c in selected)
+        avg_vals = np.mean([c["values"][:min_len] for c in selected], axis=0)
+        return avg_vals, level_name
+
+    return None, None
+
+
 # =====================
 # Gap detection / scale
 # =====================
@@ -308,19 +339,12 @@ def _apply_edge_continuity(
     prev_value: Optional[float],
     next_value: Optional[float],
     *,
-    edge_scale_min: float = EDGE_SCALE_MIN,
-    edge_scale_max: float = EDGE_SCALE_MAX,
+    edge_scale_min: float = 0.1,
+    edge_scale_max: float = 10.0,
 ) -> np.ndarray:
-    """
-    Multiplicatively rescale an already reconstructed gap so its two edges stay
-    continuous with the nearest observed points.
-
-    This fixes the main failure mode of the 7-day demo: a coarse contextual
-    fallback can pick a profile with the right broad category (for example
-    "weekend") but the wrong local level (for example Saturday-like instead of
-    Sunday-like). The gap shape is kept, but its scale is forced to agree with
-    the observations immediately before/after the block.
-    """
+    """Deprecated -- kept for backward compatibility.  Replaced by
+    ``_blend_linear_contextual`` which achieves boundary continuity without
+    the destructive multiplicative ramp."""
     adjusted = np.asarray(gap_values, dtype=float).copy()
     if adjusted.size == 0:
         return adjusted
@@ -346,6 +370,50 @@ def _apply_edge_continuity(
     adjusted *= ramp
     adjusted[adjusted < 0] = 0.0
     return adjusted
+
+
+def _blend_linear_contextual(
+    contextual: np.ndarray,
+    prev_value: Optional[float],
+    next_value: Optional[float],
+) -> np.ndarray:
+    """Blend a contextual profile with linear interpolation at gap boundaries.
+
+    Uses fixed-width cosine transitions at each edge (up to 18 points / 3 h)
+    so the gap center stays at full contextual strength while boundaries
+    match the observed values exactly.
+
+    For one-sided gaps an exponential decay anchors the known boundary.
+    """
+    gap_len = len(contextual)
+    if gap_len == 0:
+        return contextual.copy()
+
+    result = contextual.copy()
+
+    if prev_value is not None and next_value is not None:
+        linear = np.linspace(prev_value, next_value, gap_len + 2)[1:-1]
+
+        # Global cosine blend: 1 at edges, 0 at center.
+        t = np.arange(1, gap_len + 1, dtype=float) / (gap_len + 1)
+        w_cos = np.cos(np.pi * t) ** 2
+        # Max contextual contribution scales with gap length (tau = 3 days).
+        ctx_max = 1.0 - np.exp(-gap_len / 432.0)
+        w_linear = 1.0 - ctx_max * (1.0 - w_cos)
+        result = w_linear * linear + (1.0 - w_linear) * contextual
+    elif prev_value is not None:
+        tau = max(gap_len / 4.0, 1.0)
+        k = np.arange(gap_len, dtype=float)
+        w = np.exp(-k / tau)
+        result = w * prev_value + (1.0 - w) * contextual
+    elif next_value is not None:
+        tau = max(gap_len / 4.0, 1.0)
+        k = np.arange(gap_len - 1, -1, -1, dtype=float)
+        w = np.exp(-k / tau)
+        result = w * next_value + (1.0 - w) * contextual
+
+    result[result < 0] = 0.0
+    return result
 
 
 # ========================
@@ -394,10 +462,9 @@ def impute(
     date_index,
     quality: Optional[pd.Series] = None,
     *,
-    small_gap_max: int = SMALL_GAP_MAX,
     large_gap_min: int = LONG_GAP_MIN,
-    rel_noise: float = REL_NOISE,
     random_seed: Optional[int] = None,
+    **_kwargs,
 ):
     """
     Impute one consumption series with the reference contextual algorithm.
@@ -478,17 +545,10 @@ def impute(
         if end + 1 < len(values) and not is_na[end + 1]:
             next_idx = end + 1
 
-        # 1) Small gaps: linear interpolation between immediate neighbours.
-        if gap_len <= small_gap_max and prev_idx is not None and next_idx is not None:
-            y_prev = values[prev_idx]
-            y_next = values[next_idx]
-            step = (y_next - y_prev) / (gap_len + 1)
-            for k in range(gap_len):
-                values[start + k] = max(y_prev + step * (k + 1), 0.0)
-            quality_out.iloc[start : end + 1] = 1
-            continue
+        prev_value = values[prev_idx] if prev_idx is not None else None
+        next_value = values[next_idx] if next_idx is not None else None
 
-        # 2) Scale estimation from surrounding context for medium/long gaps.
+        # Scale estimation from surrounding context.
         scale = _estimate_scale_for_gap(
             start=start,
             end=end,
@@ -503,8 +563,11 @@ def impute(
             scale_max=SCALE_MAX,
         )
 
-        # 3) Long gaps: donor-day reconstruction + contextual scaling.
+        # Build raw contextual profile for the gap.
+        contextual = np.zeros(gap_len)
+
         if gap_len >= large_gap_min and len(library) > 0:
+            # --- Long gaps: multi-donor-day reconstruction ---
             gap_dates = np.unique(date_arr[start : end + 1])
 
             for d in gap_dates:
@@ -518,8 +581,8 @@ def impute(
                 dow_i = int(dow_arr[idxs[0]])
                 m_i = int(month_arr[idxs[0]])
 
-                donor_vals, _donor_date, _match_level = _choose_donor_day(
-                    library, dt_i, dow_i, m_i, rng
+                donor_vals, _match_level = _choose_donor_days(
+                    library, dt_i, dow_i, m_i
                 )
 
                 context_scale = None
@@ -535,10 +598,11 @@ def impute(
                         context_scale = mean_last / mean_donor
                         context_scale = max(SCALE_MIN, min(SCALE_MAX, context_scale))
 
-                if dt_i != "open_workday":
-                    context_scale = None
-
-                effective_scale = 0.2 * scale + 0.8 * context_scale if context_scale is not None else scale
+                effective_scale = (
+                    0.3 * scale + 0.7 * context_scale
+                    if context_scale is not None
+                    else scale
+                )
 
                 for i in idxs:
                     s_i = int(slot_arr[i])
@@ -546,51 +610,45 @@ def impute(
                         base = donor_vals[s_i]
                     else:
                         base = get_baseline(dt_i, m_i, s_i)
+                    contextual[i - start] = max(effective_scale * base, 0.0)
 
-                    v = effective_scale * base
-                    if rel_noise > 0:
-                        noise = rng.normal(1.0, rel_noise)
-                        noise = np.clip(noise, 1.0 - 3 * rel_noise, 1.0 + 3 * rel_noise)
-                        v *= noise
+            # Faded level correction for donor path: full at 1 day, decays
+            # for longer gaps where boundary mean is unreliable.
+            if prev_value is not None and next_value is not None:
+                ctx_mean = float(np.mean(contextual))
+                lin_mean = (prev_value + next_value) / 2.0
+                if ctx_mean > 1e-9:
+                    level_trust = np.exp(
+                        -(gap_len - LONG_GAP_MIN) / 72.0
+                    ) if gap_len > LONG_GAP_MIN else 1.0
+                    raw_scale = np.clip(lin_mean / ctx_mean, 0.5, 2.0)
+                    lsc = 1.0 + level_trust * (raw_scale - 1.0)
+                    contextual *= lsc
 
-                    values[i] = max(v, 0.0)
+            flag = 3
+        else:
+            # --- Medium / short gaps: contextual baseline ---
+            for i in range(start, end + 1):
+                dt_i = day_type_arr[i]
+                m_i = int(month_arr[i])
+                s_i = int(slot_arr[i])
+                base = get_baseline(dt_i, m_i, s_i)
+                contextual[i - start] = max(scale * base, 0.0)
 
-            prev_value = values[prev_idx] if prev_idx is not None else None
-            next_value = values[next_idx] if next_idx is not None else None
-            values[start : end + 1] = _apply_edge_continuity(
-                values[start : end + 1],
-                prev_value=prev_value,
-                next_value=next_value,
-            )
+            # Level-correct: match contextual mean to boundary-implied mean.
+            if prev_value is not None and next_value is not None:
+                ctx_mean = float(np.mean(contextual))
+                lin_mean = (prev_value + next_value) / 2.0
+                if ctx_mean > 1e-9:
+                    lsc = np.clip(lin_mean / ctx_mean, 0.5, 2.0)
+                    contextual *= lsc
 
-            quality_out.iloc[start : end + 1] = 3
-            continue
+            flag = 2
 
-        # 4) Medium gaps, or long gaps when donor days are unavailable:
-        #    contextual baseline + gap-level scaling + small noise.
-        for i in range(start, end + 1):
-            dt_i = day_type_arr[i]
-            m_i = int(month_arr[i])
-            s_i = int(slot_arr[i])
-
-            base = get_baseline(dt_i, m_i, s_i)
-            v = scale * base
-            if rel_noise > 0:
-                noise = rng.normal(1.0, rel_noise)
-                noise = np.clip(noise, 1.0 - 3 * rel_noise, 1.0 + 3 * rel_noise)
-                v *= noise
-
-            values[i] = max(v, 0.0)
-
-        prev_value = values[prev_idx] if prev_idx is not None else None
-        next_value = values[next_idx] if next_idx is not None else None
-        values[start : end + 1] = _apply_edge_continuity(
-            values[start : end + 1],
-            prev_value=prev_value,
-            next_value=next_value,
-        )
-
-        quality_out.iloc[start : end + 1] = 2
+        # Blend contextual profile with linear interpolation at boundaries.
+        blended = _blend_linear_contextual(contextual, prev_value, next_value)
+        values[start : end + 1] = blended
+        quality_out.iloc[start : end + 1] = flag
 
     result = pd.Series(values, index=original_index, name=getattr(series, "name", None))
 
