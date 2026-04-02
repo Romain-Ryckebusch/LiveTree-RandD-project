@@ -349,6 +349,43 @@ def _apply_edge_continuity(
 
 
 # ========================
+# Naive imputation
+# ========================
+
+def naive_impute(series: pd.Series, method: str = "linear"):
+    """
+    Naive gap filling for baseline comparison.
+
+    Parameters
+    ----------
+    series : pd.Series
+        Consumption series with NaN gaps.
+    method : str
+        'linear' for linear interpolation, 'zero' for zero-padding.
+
+    Returns
+    -------
+    (pd.Series, pd.Series)
+        Imputed series and quality flags (1 = imputed, 0 = original).
+    """
+    is_na = series.isna()
+    imputed = series.copy()
+
+    if method == "zero":
+        imputed = imputed.fillna(0.0)
+    else:
+        imputed = imputed.interpolate(method="linear")
+        imputed = imputed.ffill().bfill()
+
+    quality = pd.Series(
+        np.where(is_na, 1, 0),
+        index=series.index,
+        dtype=int,
+    )
+    return imputed, quality
+
+
+# ========================
 # Public demo entry point
 # ========================
 

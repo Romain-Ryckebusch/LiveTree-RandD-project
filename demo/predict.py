@@ -95,12 +95,20 @@ def predict_day(target_timestamps, weather_temps, history_df):
     """
     entr = _build_feature_matrix(target_timestamps, weather_temps, history_df)
 
-    model = tf.keras.models.load_model(MODEL_FILE)
+    model = tf.keras.models.load_model(MODEL_FILE, compile=False)
     scaler_x = joblib.load(SCALER_X_FILE)
     scaler_y = joblib.load(SCALER_Y_FILE)
 
+    # Patch scalers saved with sklearn<0.24 (missing 'clip' attr)
+    for sc in (scaler_x, scaler_y):
+        if not hasattr(sc, "clip"):
+            sc.clip = False
+
     x_scaled = scaler_x.transform(entr)
+    # Model saved with input_shape=(None,15) expects 3D; reshape for Keras 3
+    x_scaled = np.expand_dims(x_scaled, axis=1)
     y_scaled = model.predict(x_scaled)
+    y_scaled = y_scaled.reshape(-1, 1)
     predictions = scaler_y.inverse_transform(y_scaled)
 
     return predictions.flatten()

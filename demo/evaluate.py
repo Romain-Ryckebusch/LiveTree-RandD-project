@@ -35,7 +35,7 @@ def mape(actual, predicted):
     return float(np.mean(np.abs((actual[mask] - predicted[mask]) / actual[mask])) * 100)
 
 
-def evaluate(baseline_pred, imputed_pred, actual=None):
+def evaluate(baseline_pred, imputed_pred, actual=None, naive_pred=None):
     """
     Compare baseline (no-gap) predictions against imputed predictions.
 
@@ -51,6 +51,13 @@ def evaluate(baseline_pred, imputed_pred, actual=None):
         }
     }
 
+    if naive_pred is not None:
+        results["baseline_vs_naive"] = {
+            "mae": mae(baseline_pred, naive_pred),
+            "rmse": rmse(baseline_pred, naive_pred),
+            "mape": mape(baseline_pred, naive_pred),
+        }
+
     if actual is not None:
         results["baseline_vs_actual"] = {
             "mae": mae(actual, baseline_pred),
@@ -62,6 +69,12 @@ def evaluate(baseline_pred, imputed_pred, actual=None):
             "rmse": rmse(actual, imputed_pred),
             "mape": mape(actual, imputed_pred),
         }
+        if naive_pred is not None:
+            results["naive_vs_actual"] = {
+                "mae": mae(actual, naive_pred),
+                "rmse": rmse(actual, naive_pred),
+                "mape": mape(actual, naive_pred),
+            }
 
     return results
 
@@ -109,6 +122,10 @@ class ScenarioResult:
     history_imputed: Optional[np.ndarray] = None
     quality_flags: Optional[np.ndarray] = None
 
+    # Naive imputation results
+    naive_pred: Optional[np.ndarray] = None
+    history_naive: Optional[np.ndarray] = None
+
     # Gap info: list of (start, end) for blocks, or list of int for random
     gap_info: list = field(default_factory=list)
 
@@ -143,6 +160,8 @@ def save_summary_table(results: List[ScenarioResult], output_dir: str):
                 "baseline_vs_imputed": "bvi",
                 "baseline_vs_actual": "bva",
                 "imputed_vs_actual": "iva",
+                "baseline_vs_naive": "bvn",
+                "naive_vs_actual": "nva",
             }.get(comparison, comparison)
             for metric_name, value in metrics.items():
                 row[f"{prefix}_{metric_name}"] = value

@@ -59,6 +59,10 @@ def plot_predictions(result, output_dir):
         ax.plot(timestamps, result.actual, label="Actual",
                 color="#4daf4a", linewidth=1.2, linestyle=":")
 
+    if result.naive_pred is not None:
+        ax.plot(timestamps, result.naive_pred, label="Naive",
+                color="#e08214", linewidth=1.5, linestyle="-.")
+
     ax.set_xlabel("Time")
     ax.set_ylabel("Power (W)")
     ax.set_title(f"Predictions for {result.target_date},{result.scenario_label}")
@@ -69,6 +73,42 @@ def plot_predictions(result, output_dir):
     fig.tight_layout()
 
     path = os.path.join(output_dir, "predictions.png")
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  Saved {path}")
+
+
+# ---------------------------------------------------------------------------
+# Plot A2: Reference prediction (clean data, no gaps)
+# ---------------------------------------------------------------------------
+
+def plot_reference(timestamps, baseline_pred, output_dir, target_date):
+    """
+    Plot the reference (clean-data) prediction for a target date.
+
+    Parameters
+    ----------
+    timestamps : list of datetime
+    baseline_pred : np.ndarray (144,)
+    output_dir : str
+    target_date : str
+    """
+    _ensure_dir(output_dir)
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.plot(timestamps, baseline_pred, label="Reference prediction (no gaps)",
+            color="#2166ac", linewidth=1.5)
+
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Power (W)")
+    ax.set_title(f"Reference prediction for {target_date} ({BUILDING_COLUMN})")
+    ax.legend(loc="upper right")
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+    ax.grid(True, alpha=0.3)
+    fig.autofmt_xdate()
+    fig.tight_layout()
+
+    path = os.path.join(output_dir, "reference_prediction.png")
     fig.savefig(path, dpi=150)
     plt.close(fig)
     print(f"  Saved {path}")
@@ -212,14 +252,15 @@ def plot_metrics_bars(result, output_dir):
 
 def plot_scenario_comparison(results, output_dir, metric="mae"):
     """
-    Bar chart comparing a single metric across multiple scenarios.
+    Grouped bar chart comparing smart vs naive imputation across scenarios.
 
     Parameters
     ----------
     results : list of ScenarioResult
     output_dir : str
     metric : str
-        Which metric to plot (default: "mae"). Uses baseline_vs_imputed comparison.
+        Which metric to plot (default: "mae"). Uses baseline_vs_imputed
+        and baseline_vs_naive comparisons.
     """
     if not results:
         return
@@ -227,25 +268,43 @@ def plot_scenario_comparison(results, output_dir, metric="mae"):
     _ensure_dir(output_dir)
 
     labels = []
-    values = []
+    smart_vals = []
+    naive_vals = []
     for r in results:
         bvi = r.metrics.get("baseline_vs_imputed", {})
-        val = bvi.get(metric, float("nan"))
-        if not np.isnan(val):
+        bvn = r.metrics.get("baseline_vs_naive", {})
+        s_val = bvi.get(metric, float("nan"))
+        n_val = bvn.get(metric, float("nan"))
+        if not np.isnan(s_val):
             labels.append(r.scenario_label)
-            values.append(val)
+            smart_vals.append(s_val)
+            naive_vals.append(n_val if not np.isnan(n_val) else 0)
 
-    if not values:
+    if not smart_vals:
         return
 
-    fig, ax = plt.subplots(figsize=(max(8, len(values) * 1.5), 5))
+    has_naive = any(v > 0 for v in naive_vals)
+    fig, ax = plt.subplots(figsize=(max(8, len(labels) * 1.5), 5))
     x = np.arange(len(labels))
-    bars = ax.bar(x, values, color="#2166ac", width=0.6)
 
-    # Value labels on bars
-    for bar, val in zip(bars, values):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
-                f"{val:.1f}", ha="center", va="bottom", fontsize=9)
+    if has_naive:
+        width = 0.35
+        bars_smart = ax.bar(x - width / 2, smart_vals, width,
+                            label="Contextual imputation", color="#2166ac")
+        bars_naive = ax.bar(x + width / 2, naive_vals, width,
+                            label="Naive imputation", color="#e08214")
+        for bar, val in zip(bars_smart, smart_vals):
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                    f"{val:.1f}", ha="center", va="bottom", fontsize=8)
+        for bar, val in zip(bars_naive, naive_vals):
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                    f"{val:.1f}", ha="center", va="bottom", fontsize=8)
+        ax.legend()
+    else:
+        bars = ax.bar(x, smart_vals, color="#2166ac", width=0.6)
+        for bar, val in zip(bars, smart_vals):
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                    f"{val:.1f}", ha="center", va="bottom", fontsize=9)
 
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=9)

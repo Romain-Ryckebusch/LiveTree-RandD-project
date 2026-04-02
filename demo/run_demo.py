@@ -29,7 +29,7 @@ from config import (
     OUTPUT_DIR,
 )
 from gap_injector import inject_block_gaps, inject_random_gaps
-from imputer import impute
+from imputer import impute, naive_impute
 from predict import predict_day
 from evaluate import (
     evaluate,
@@ -40,6 +40,7 @@ from evaluate import (
 )
 from plotting import (
     plot_predictions,
+    plot_reference,
     plot_history_gaps,
     plot_metrics_bars,
     plot_scenario_comparison,
@@ -135,6 +136,45 @@ def _make_label(args):
     return f"random_{args.n_points}"
 
 
+def run_reference(args):
+    """
+    Reference mode: predict on clean data only (no gaps, no imputation).
+
+    Produces the baseline prediction for the target date and saves it as CSV.
+    """
+    print("=== Reference prediction mode ===")
+    hist_df = load_historical_data()
+    weather_df = load_weather_data()
+
+    print(f"Target date: {args.target_date}")
+    print(f"Building: {BUILDING_COLUMN}")
+
+    history, target_ts, weather, actual = extract_window(
+        hist_df, args.target_date, weather_df
+    )
+    print(f"History window: {len(history)} points")
+
+    baseline_pred = predict_day(target_ts, weather, history)
+    print(f"Predictions: min={baseline_pred.min():.0f}, max={baseline_pred.max():.0f}")
+
+    # Save as CSV
+    out_dir = os.path.join(args.output_dir, f"reference_{args.target_date}")
+    os.makedirs(out_dir, exist_ok=True)
+
+    pred_df = pd.DataFrame({
+        "timestamp": target_ts,
+        "predicted_power_W": baseline_pred,
+    })
+    csv_path = os.path.join(out_dir, "reference_prediction.csv")
+    pred_df.to_csv(csv_path, index=False)
+    print(f"Saved {csv_path}")
+
+    if args.save_plots:
+        plot_reference(target_ts, baseline_pred, out_dir, args.target_date)
+
+    print("\nReference prediction complete.")
+
+
 def run(args, hist_df=None, weather_df=None, quiet=False):
     """
     Run a single scenario: inject gaps, impute, predict, evaluate.
@@ -208,6 +248,22 @@ def run(args, hist_df=None, weather_df=None, quiet=False):
     nan_count = np.isnan(history_gapped_values).sum()
     log(f"Total NaN in window: {nan_count}/{len(history_gapped)}")
 
+    # --- Naive imputation ---
+    naive_method = getattr(args, "naive_method", "linear")
+    log(f"\n=== Naive imputation ({naive_method}) ===")
+    naive_series, _naive_quality = naive_impute(
+        history_gapped[BUILDING_COLUMN], method=naive_method
+    )
+    history_naive_df = history_gapped.copy()
+    history_naive_df[BUILDING_COLUMN] = naive_series.values
+    history_naive_values = history_naive_df[BUILDING_COLUMN].values.copy()
+    log(f"Remaining NaN after naive imputation: {np.isnan(history_naive_values).sum()}")
+
+    # --- Naive prediction ---
+    log("\n=== Naive prediction ===")
+    naive_pred = predict_day(target_ts, weather, history_naive_df)
+    log(f"Naive predictions: min={naive_pred.min():.0f}, max={naive_pred.max():.0f}")
+
     # --- Impute ---
     log("\n=== Imputation ===")
     imputed_series, quality = impute(
@@ -235,7 +291,7 @@ def run(args, hist_df=None, weather_df=None, quiet=False):
 
     # --- Evaluate ---
     log("\n=== Evaluation ===")
-    metrics = evaluate(baseline_pred, imputed_pred, actual)
+    metrics = evaluate(baseline_pred, imputed_pred, actual, naive_pred=naive_pred)
     if not quiet:
         print_report(metrics)
 
@@ -256,6 +312,8 @@ def run(args, hist_df=None, weather_df=None, quiet=False):
         history_gapped=history_gapped_values,
         history_imputed=history_imputed_values,
         quality_flags=quality_values,
+        naive_pred=naive_pred,
+        history_naive=history_naive_values,
         gap_info=gap_info,
         metrics=metrics,
     )
@@ -319,7 +377,22 @@ def main():
         default=None,
         help="Path to a JSON file defining multiple gap scenarios to run in batch",
     )
+    parser.add_argument(
+        "--reference-only",
+        action="store_true",
+        help="Run baseline prediction only (no gap injection or imputation).",
+    )
+    parser.add_argument(
+        "--naive-method",
+        choices=["linear", "zero"],
+        default="linear",
+        help="Naive imputation method: 'linear' (interpolation) or 'zero' (zero-padding). Default: linear.",
+    )
     args = parser.parse_args()
+
+    if args.reference_only:
+        run_reference(args)
+        return
 
     if args.scenarios:
         # --- Multi-scenario mode ---
@@ -341,6 +414,7 @@ def main():
                 n_points=sdef.get("n_points", args.n_points),
                 seed=sdef.get("seed", args.seed),
                 label=sdef.get("label", f"scenario_{i+1}"),
+                naive_method=args.naive_method,
             )
             print(f"\n{'='*60}")
             print(f"Scenario {i+1}/{len(scenario_defs)}: {scenario_args.label}")
