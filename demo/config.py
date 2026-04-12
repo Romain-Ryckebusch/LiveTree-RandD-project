@@ -1,9 +1,5 @@
-"""
-Centralized configuration for the single-building demo pipeline.
-"""
 import os
 
-# --- Paths ---
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.environ.get(
     "DEMO_DATA_DIR",
@@ -26,26 +22,24 @@ HISTORICAL_CSV = os.path.join(DATA_DIR, "2026 historical data.csv")
 WEATHER_CSV = os.path.join(DATA_DIR, "2026 weather data.csv")
 HOLIDAYS_XLSX = os.path.join(MODEL_DIR, "Holidays.xlsx")
 
-# --- Demo building ---
-# Single building for the demo; multi-building comes later.
+# Mar 22 - Apr 10 2026 CSVs at project root, extending HISTORICAL_CSV.
+RECENT_HA_CSV = os.path.join(PROJECT_ROOT, "Cons_Hotel Academic_2026-03-22_2026-04-10.csv")
+RECENT_SITE_CSV = os.path.join(PROJECT_ROOT, "Cons_Historical Site_2026-03-22_2026-04-10.csv")
+
 BUILDING_COLUMN = "Ptot_HA"
 MODEL_SUFFIX = "HA_Puissances_Ptot"
 
-# Model files (version "3" = latest)
 MODEL_FILE = os.path.join(MODEL_DIR, f"my_modelCons3{MODEL_SUFFIX}.h5")
 SCALER_Y_FILE = os.path.join(MODEL_DIR, f"scalerConso{MODEL_SUFFIX}.save")
 SCALER_X_FILE = os.path.join(MODEL_DIR, f"scalerxConso{MODEL_SUFFIX}.save")
 
-# --- Data constants ---
-POINTS_PER_DAY = 144  # 10-minute intervals
+POINTS_PER_DAY = 144
 LOOKBACK_DAYS = 7
-LOOKBACK_POINTS = POINTS_PER_DAY * LOOKBACK_DAYS  # 1008
+LOOKBACK_POINTS = POINTS_PER_DAY * LOOKBACK_DAYS
 FREQ = "10min"
 
-# --- Timezone ---
 TIMEZONE = "Europe/Paris"
 
-# --- Output ---
 OUTPUT_DIR = os.environ.get(
     "DEMO_OUTPUT_DIR",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "output"),

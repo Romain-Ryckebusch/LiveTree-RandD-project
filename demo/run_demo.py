@@ -22,6 +22,7 @@ import pytz
 from config import (
     HISTORICAL_CSV,
     WEATHER_CSV,
+    RECENT_HA_CSV,
     BUILDING_COLUMN,
     LOOKBACK_POINTS,
     POINTS_PER_DAY,
@@ -48,42 +49,43 @@ from plotting import (
 
 
 def load_historical_data():
-    """Load and prepare the historical consumption CSV."""
+    # Combines the Jan-Mar HISTORICAL_CSV with the Mar 22 - Apr 10 RECENT_HA_CSV.
+    # The two are non-overlapping and only Ptot_HA is reliable in the second.
     df = pd.read_csv(HISTORICAL_CSV, parse_dates=["Date"])
     df = df.sort_values("Date").reset_index(drop=True)
-    return df
+    try:
+        recent = pd.read_csv(RECENT_HA_CSV, parse_dates=["Date"])
+    except FileNotFoundError:
+        return df
+    if "Ptot_HA" not in recent.columns:
+        return df
+    recent = recent[["Date", "Ptot_HA"]].dropna(subset=["Ptot_HA"])
+    merged = pd.concat([df, recent], ignore_index=True, sort=False)
+    merged = (
+        merged.drop_duplicates(subset=["Date"], keep="last")
+        .sort_values("Date")
+        .reset_index(drop=True)
+    )
+    return merged
 
 
 def load_weather_data():
-    """Load the weather CSV."""
     df = pd.read_csv(WEATHER_CSV, parse_dates=["Date"])
     df = df.sort_values("Date").reset_index(drop=True)
     return df
 
 
 def extract_window(df, target_date, weather_df):
-    """
-    Extract the 7-day history window and target-day weather for a given date.
-
-    Returns
-    -------
-    history_df : DataFrame (up to 1008 rows)
-    target_timestamps : list of datetime (144)
-    weather_temps : array (144)
-    actual_target : array (144) or None
-    """
     tz = pytz.timezone(TIMEZONE)
 
     target_start = tz.localize(pd.Timestamp(target_date))
     target_end = target_start + pd.Timedelta(hours=23, minutes=50)
     history_start = target_start - pd.Timedelta(days=7)
 
-    # Localize CSV dates if needed (work on a copy to avoid side effects)
     df = df.copy()
     if df["Date"].dt.tz is None:
         df["Date"] = df["Date"].dt.tz_localize("UTC").dt.tz_convert(tz)
 
-    # Extract 7-day history
     mask_hist = (df["Date"] >= history_start) & (df["Date"] < target_start)
     history = df.loc[mask_hist].copy().reset_index(drop=True)
 
@@ -93,16 +95,13 @@ def extract_window(df, target_date, weather_df):
             f"(expected {LOOKBACK_POINTS}). Proceeding anyway."
         )
 
-    # Truncate to exactly 1008
     if len(history) > LOOKBACK_POINTS:
         history = history.iloc[-LOOKBACK_POINTS:].reset_index(drop=True)
 
-    # Target day timestamps
     target_timestamps = pd.date_range(
         target_start, target_end, freq="10min"
     ).tolist()
 
-    # Weather for target day
     weather_df = weather_df.copy()
     if weather_df["Date"].dt.tz is None:
         weather_df["Date"] = weather_df["Date"].dt.tz_localize("UTC").dt.tz_convert(tz)
@@ -119,7 +118,6 @@ def extract_window(df, target_date, weather_df):
         if len(weather_slice) > 0:
             weather_temps[: len(weather_slice)] = weather_slice["AirTemp"].values
 
-    # Actual target day consumption (for evaluation, if available)
     mask_actual = (df["Date"] >= target_start) & (df["Date"] <= target_end)
     actual_slice = df.loc[mask_actual]
     actual_target = None
@@ -130,26 +128,20 @@ def extract_window(df, target_date, weather_df):
 
 
 def _make_label(args):
-    """Build a scenario label from gap parameters."""
     if args.gap_mode == "blocks":
         return f"blocks_{args.block_length}x{args.n_blocks}"
     return f"random_{args.n_points}"
 
 
 def run_reference(args):
-    """
-    Reference mode: predict on clean data only (no gaps, no imputation).
-
-    Produces the baseline prediction for the target date and saves it as CSV.
-    """
-    print("=== Reference prediction mode ===")
+    print("Reference prediction mode")
     hist_df = load_historical_data()
     weather_df = load_weather_data()
 
     print(f"Target date: {args.target_date}")
     print(f"Building: {BUILDING_COLUMN}")
 
-    history, target_ts, weather, actual = extract_window(
+    history, target_ts, weather, _actual = extract_window(
         hist_df, args.target_date, weather_df
     )
     print(f"History window: {len(history)} points")
@@ -176,21 +168,6 @@ def run_reference(args):
 
 
 def run(args, hist_df=None, weather_df=None, quiet=False):
-    """
-    Run a single scenario: inject gaps, impute, predict, evaluate.
-
-    Parameters
-    ----------
-    args : argparse.Namespace or similar object with gap config fields.
-    hist_df, weather_df : DataFrames, optional
-        Pre-loaded data (avoids reloading in multi-scenario mode).
-    quiet : bool
-        Suppress console output.
-
-    Returns
-    -------
-    ScenarioResult with all intermediate data and metrics.
-    """
     def log(msg):
         if not quiet:
             print(msg)
@@ -205,21 +182,18 @@ def run(args, hist_df=None, weather_df=None, quiet=False):
     log(f"Target date: {args.target_date}")
     log(f"Building: {BUILDING_COLUMN}")
 
-    history, target_ts, weather, actual = extract_window(
+    history, target_ts, weather, _actual = extract_window(
         hist_df, args.target_date, weather_df
     )
     log(f"History window: {len(history)} points")
 
-    # Save clean history before gap injection
     history_clean = history[BUILDING_COLUMN].values.copy()
 
-    # --- Baseline prediction (clean data, no gaps) ---
-    log("\n=== Baseline prediction (no gaps) ===")
+    log("\nBaseline prediction (no gaps)")
     baseline_pred = predict_day(target_ts, weather, history)
     log(f"Baseline predictions: min={baseline_pred.min():.0f}, max={baseline_pred.max():.0f}")
 
-    # --- Inject gaps ---
-    log(f"\n=== Injecting gaps (mode={args.gap_mode}) ===")
+    log(f"\nInjecting gaps (mode={args.gap_mode})")
     history_gapped = history.copy()
     gap_info = []
     if args.gap_mode == "blocks":
@@ -248,9 +222,8 @@ def run(args, hist_df=None, weather_df=None, quiet=False):
     nan_count = np.isnan(history_gapped_values).sum()
     log(f"Total NaN in window: {nan_count}/{len(history_gapped)}")
 
-    # --- Naive imputation ---
     naive_method = getattr(args, "naive_method", "linear")
-    log(f"\n=== Naive imputation ({naive_method}) ===")
+    log(f"\nNaive imputation ({naive_method})")
     naive_series, _naive_quality = naive_impute(
         history_gapped[BUILDING_COLUMN], method=naive_method
     )
@@ -259,13 +232,11 @@ def run(args, hist_df=None, weather_df=None, quiet=False):
     history_naive_values = history_naive_df[BUILDING_COLUMN].values.copy()
     log(f"Remaining NaN after naive imputation: {np.isnan(history_naive_values).sum()}")
 
-    # --- Naive prediction ---
-    log("\n=== Naive prediction ===")
+    log("\nNaive prediction")
     naive_pred = predict_day(target_ts, weather, history_naive_df)
     log(f"Naive predictions: min={naive_pred.min():.0f}, max={naive_pred.max():.0f}")
 
-    # --- Impute ---
-    log("\n=== Imputation ===")
+    log("\nImputation")
     imputed_series, quality = impute(
         history_gapped[BUILDING_COLUMN],
         history_gapped["Date"],
@@ -284,14 +255,12 @@ def run(args, hist_df=None, weather_df=None, quiet=False):
         if count > 0:
             log(f"  {flag} ({flag_label}): {count}")
 
-    # --- Prediction on imputed data ---
-    log("\n=== Imputed prediction ===")
+    log("\nImputed prediction")
     imputed_pred = predict_day(target_ts, weather, history_imputed)
     log(f"Imputed predictions: min={imputed_pred.min():.0f}, max={imputed_pred.max():.0f}")
 
-    # --- Evaluate ---
-    log("\n=== Evaluation ===")
-    metrics = evaluate(baseline_pred, imputed_pred, actual, naive_pred=naive_pred)
+    log("\nEvaluation")
+    metrics = evaluate(baseline_pred, imputed_pred, naive_pred=naive_pred)
     if not quiet:
         print_report(metrics)
 
@@ -305,7 +274,6 @@ def run(args, hist_df=None, weather_df=None, quiet=False):
         seed=args.seed,
         baseline_pred=baseline_pred,
         imputed_pred=imputed_pred,
-        actual=actual,
         target_timestamps=target_ts,
         history_dates=history["Date"],
         history_clean=history_clean,
@@ -395,7 +363,6 @@ def main():
         return
 
     if args.scenarios:
-        # --- Multi-scenario mode ---
         with open(args.scenarios) as f:
             scenario_defs = json.load(f)
 
@@ -405,7 +372,6 @@ def main():
 
         all_results = []
         for i, sdef in enumerate(scenario_defs):
-            # Merge scenario def with CLI defaults
             scenario_args = argparse.Namespace(
                 target_date=args.target_date,
                 gap_mode=sdef.get("gap_mode", args.gap_mode),
@@ -416,9 +382,7 @@ def main():
                 label=sdef.get("label", f"scenario_{i+1}"),
                 naive_method=args.naive_method,
             )
-            print(f"\n{'='*60}")
-            print(f"Scenario {i+1}/{len(scenario_defs)}: {scenario_args.label}")
-            print(f"{'='*60}")
+            print(f"\nScenario {i+1}/{len(scenario_defs)}: {scenario_args.label}")
 
             result = run(scenario_args, hist_df=hist_df, weather_df=weather_df)
             all_results.append(result)
@@ -438,18 +402,14 @@ def main():
         if args.save_plots and len(all_results) > 1:
             plot_scenario_comparison(all_results, args.output_dir)
 
-        # Print aggregate stats
         agg = compute_aggregate(all_results)
         if agg:
-            print(f"\n{'='*60}")
-            print("Aggregate statistics across all scenarios")
-            print(f"{'='*60}")
+            print("\nAggregate statistics across all scenarios")
             for key, stats in agg.items():
                 print(f"  {key}: mean={stats['mean']:.2f} std={stats['std']:.2f} "
                       f"min={stats['min']:.2f} max={stats['max']:.2f}")
 
     else:
-        # --- Single-scenario mode ---
         result = run(args)
 
         if args.save_plots:
