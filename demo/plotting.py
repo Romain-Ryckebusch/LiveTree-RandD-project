@@ -1,10 +1,3 @@
-"""
-Plotting module for the evaluation framework.
-
-Generates matplotlib figures for prediction comparison, gap visualization,
-metrics bar charts, and multi-scenario degradation analysis.
-All plots save to PNG and close the figure to avoid memory leaks in batch mode.
-"""
 import os
 
 import matplotlib
@@ -16,10 +9,6 @@ import numpy as np
 from config import BUILDING_COLUMN
 
 
-# ---------------------------------------------------------------------------
-# Quality flag colors
-# ---------------------------------------------------------------------------
-
 QUALITY_COLORS = {
     0: ("white", "Real data"),
     1: ("#fee08b", "Linear interpolation"),
@@ -28,24 +17,9 @@ QUALITY_COLORS = {
 }
 
 
-def _ensure_dir(path):
-    os.makedirs(path, exist_ok=True)
-
-
-# ---------------------------------------------------------------------------
-# Plot A: Prediction overlay
-# ---------------------------------------------------------------------------
-
 def plot_predictions(result, output_dir):
-    """
-    Time series overlay of baseline vs imputed predictions (+ actual if available).
-
-    Parameters
-    ----------
-    result : ScenarioResult
-    output_dir : str
-    """
-    _ensure_dir(output_dir)
+    """Overlay baseline and imputed predictions on a single time axis."""
+    os.makedirs(output_dir, exist_ok=True)
 
     timestamps = result.target_timestamps
     fig, ax = plt.subplots(figsize=(12, 5))
@@ -54,10 +28,6 @@ def plot_predictions(result, output_dir):
             color="#2166ac", linewidth=1.5)
     ax.plot(timestamps, result.imputed_pred, label="Imputed",
             color="#d6604d", linewidth=1.5, linestyle="--")
-
-    if result.actual is not None:
-        ax.plot(timestamps, result.actual, label="Actual",
-                color="#4daf4a", linewidth=1.2, linestyle=":")
 
     if result.naive_pred is not None:
         ax.plot(timestamps, result.naive_pred, label="Naive",
@@ -78,22 +48,9 @@ def plot_predictions(result, output_dir):
     print(f"  Saved {path}")
 
 
-# ---------------------------------------------------------------------------
-# Plot A2: Reference prediction (clean data, no gaps)
-# ---------------------------------------------------------------------------
-
 def plot_reference(timestamps, baseline_pred, output_dir, target_date):
-    """
-    Plot the reference (clean-data) prediction for a target date.
-
-    Parameters
-    ----------
-    timestamps : list of datetime
-    baseline_pred : np.ndarray (144,)
-    output_dir : str
-    target_date : str
-    """
-    _ensure_dir(output_dir)
+    """Plot the clean-data baseline prediction for a target date."""
+    os.makedirs(output_dir, exist_ok=True)
 
     fig, ax = plt.subplots(figsize=(12, 5))
     ax.plot(timestamps, baseline_pred, label="Reference prediction (no gaps)",
@@ -114,23 +71,12 @@ def plot_reference(timestamps, baseline_pred, output_dir, target_date):
     print(f"  Saved {path}")
 
 
-# ---------------------------------------------------------------------------
-# Plot B: History window with gaps and imputation
-# ---------------------------------------------------------------------------
-
 def plot_history_gaps(result, output_dir):
-    """
-    7-day history window showing clean data, gaps, and color-coded imputation.
-
-    Parameters
-    ----------
-    result : ScenarioResult
-    output_dir : str
-    """
+    """7-day history window with color-coded imputed regions."""
     if result.history_dates is None or result.history_clean is None:
         return
 
-    _ensure_dir(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
 
     dates = result.history_dates
     if hasattr(dates, "values"):
@@ -138,16 +84,13 @@ def plot_history_gaps(result, output_dir):
 
     fig, ax = plt.subplots(figsize=(14, 5))
 
-    # Clean history as light background reference
     ax.plot(dates, result.history_clean, color="#bdbdbd",
             linewidth=0.8, label="Clean data", zorder=1)
 
-    # Imputed history
     if result.history_imputed is not None:
         ax.plot(dates, result.history_imputed, color="#2166ac",
                 linewidth=1.2, label="Imputed data", zorder=2)
 
-    # Color-coded background spans for imputed regions
     if result.quality_flags is not None:
         flags = result.quality_flags
         i = 0
@@ -164,7 +107,6 @@ def plot_history_gaps(result, output_dir):
             else:
                 i += 1
 
-    # Deduplicate legend entries
     handles, labels = ax.get_legend_handles_labels()
     seen = {}
     unique_handles = []
@@ -190,20 +132,9 @@ def plot_history_gaps(result, output_dir):
     print(f"  Saved {path}")
 
 
-# ---------------------------------------------------------------------------
-# Plot C: Metrics bar chart (single scenario)
-# ---------------------------------------------------------------------------
-
 def plot_metrics_bars(result, output_dir):
-    """
-    Grouped bar chart of MAE, RMSE, MAPE for one scenario.
-
-    Parameters
-    ----------
-    result : ScenarioResult
-    output_dir : str
-    """
-    _ensure_dir(output_dir)
+    """MAE/RMSE on the left axis, MAPE on the right (different units)."""
+    os.makedirs(output_dir, exist_ok=True)
     metrics = result.metrics
     if not metrics:
         return
@@ -213,7 +144,6 @@ def plot_metrics_bars(result, output_dir):
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
 
-    # MAE and RMSE on the left axis (same unit: watts)
     x = np.arange(len(comparisons))
     width = 0.35
     mae_vals = [metrics[c].get("mae", 0) for c in comparisons]
@@ -228,7 +158,6 @@ def plot_metrics_bars(result, output_dir):
     ax1.legend()
     ax1.grid(True, alpha=0.3, axis="y")
 
-    # MAPE on the right (percentage)
     mape_vals = [metrics[c].get("mape", 0) for c in comparisons]
     ax2.bar(x, mape_vals, width * 2, color="#4daf4a")
     ax2.set_xticks(x)
@@ -246,26 +175,12 @@ def plot_metrics_bars(result, output_dir):
     print(f"  Saved {path}")
 
 
-# ---------------------------------------------------------------------------
-# Plot D: Multi-scenario comparison
-# ---------------------------------------------------------------------------
-
 def plot_scenario_comparison(results, output_dir, metric="mae"):
-    """
-    Grouped bar chart comparing smart vs naive imputation across scenarios.
-
-    Parameters
-    ----------
-    results : list of ScenarioResult
-    output_dir : str
-    metric : str
-        Which metric to plot (default: "mae"). Uses baseline_vs_imputed
-        and baseline_vs_naive comparisons.
-    """
+    """Compare contextual vs naive imputation across all scenarios."""
     if not results:
         return
 
-    _ensure_dir(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
 
     labels = []
     smart_vals = []

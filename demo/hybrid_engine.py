@@ -18,37 +18,17 @@ except ImportError:
 
 SITE_COLS = ['Ptot_HA', 'Ptot_HEI', 'Ptot_HEI_13RT', 'Ptot_HEI_5RNS', 'Ptot_RIZOMM', 'Ptot_Ilot']
 
-def _load_all_holidays():
-    """Load holidays, close days, and special days from 2021-2026 files.
-    Return three separate sets with different consumption profiles.
-    """
-    holidays = set()      # Reduced consumption (bank holidays)
-    close_days = set()    # Near-zero consumption (site closures)
-    special_days = set()  # Custom patterns (bridges, academic days, etc.)
-    years = [2021, 2022, 2023, 2024, 2025, 2026]
-    
-    # Load each year's holidays, close dates, and special dates
-    for year in years:
-        file_map = {'Holiday': holidays, 'Close': close_days, 'Special': special_days}
-        for ftype, target_set in file_map.items():
-            fname = f'data/Consumption_{year}_{ftype}.csv'
-            try:
-                df = pd.read_csv(fname, header=0, names=['date'], parse_dates=['date'])
-                target_set.update(df['date'].dt.date.unique())
-            except FileNotFoundError:
-                pass
-    
-    # Fallback 2026 holidays (major French holidays)
-    fallback_holidays = [
+def _default_holidays():
+    """Hardcoded fallback list of major 2026 French bank holidays."""
+    holidays = set()
+    for m, d in [
         (1, 1), (4, 5), (4, 6), (5, 1), (5, 8), (5, 14), (5, 25),
-        (7, 14), (8, 15), (11, 1), (11, 11), (12, 25)
-    ]
-    for m, d in fallback_holidays:
+        (7, 14), (8, 15), (11, 1), (11, 11), (12, 25),
+    ]:
         holidays.add(date(2026, m, d))
-    
-    return holidays, close_days, special_days
+    return holidays, set(), set()
 
-FRANCE_HOLIDAYS_2026, FRANCE_CLOSE_DAYS_2026, FRANCE_SPECIAL_DAYS_2026 = _load_all_holidays()
+FRANCE_HOLIDAYS_2026, FRANCE_CLOSE_DAYS_2026, FRANCE_SPECIAL_DAYS_2026 = _default_holidays()
 
 
 class TemperatureAwareHybridEngine:
@@ -59,6 +39,7 @@ class TemperatureAwareHybridEngine:
         site_cols: Optional[List[str]] = None,
         weather_df: Optional[pd.DataFrame] = None,
         use_historical_data: bool = True,
+        template_cache_file: str = 'templates_cache.pkl',
     ):
         self.site_cols = site_cols or SITE_COLS
         self.weather_df = weather_df
@@ -77,7 +58,7 @@ class TemperatureAwareHybridEngine:
         self.strategy_log: List[Dict] = []
         self._templates: Optional[Dict] = None
         self._rolling: Optional[Dict] = None
-        self._template_cache_file = 'templates_cache.pkl'
+        self._template_cache_file = template_cache_file
         self._cache_fingerprint: Optional[str] = None
         self._hm_cache: Dict = {}  # Cache for time-of-day formatting
 
@@ -400,7 +381,7 @@ class TemperatureAwareHybridEngine:
             try:
                 self.weather_df = pd.read_csv('data/2026 weather data.csv')
                 print(f"[OK] Loaded weather data: {len(self.weather_df):,} records")
-            except FileNotFoundError:
+            except Exception:
                 print("[WARN] No weather data file found, proceeding without external temperature")
                 return df
         
@@ -1005,7 +986,16 @@ class TemperatureAwareHybridEngine:
         adjusted = filled + level_ramp
         
         if len(filled) > 1:
-            quad_correction = (before_slope * (1.0 - gap_pos) + after_slope * gap_pos) * (filled_times - filled[0]) / (len(filled) - 1 if len(filled) > 1 else 1.0)
+            # NOTE: original code wrote `filled[0]` here, conflating the value
+            # of the first filled point with the time index zero. With filled[0]
+            # ~ 100k W, the correction blew up to ±10⁵ and made the engine
+            # produce wildly extrapolated values that the >40% validation
+            # fallback then collapsed to a flat constant. Use the time index.
+            quad_correction = (
+                (before_slope * (1.0 - gap_pos) + after_slope * gap_pos)
+                * (filled_times - filled_times[0])
+                / (len(filled) - 1)
+            )
             adjusted = adjusted + 0.2 * quad_correction
         
         df.loc[start_idx:end_idx - 1, site] = adjusted
