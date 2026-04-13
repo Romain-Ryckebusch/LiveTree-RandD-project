@@ -96,7 +96,9 @@ class TemperatureAwareHybridEngine:
 
         self._hm_cache = {}
         if 'Timestamp' in df.columns:
-            for ts in df['Timestamp'].unique():
+            # pd.DatetimeIndex yields pd.Timestamp; a bare .unique() on a
+            # datetime64 Series returns numpy.datetime64 in pandas 1.0.x.
+            for ts in pd.DatetimeIndex(df['Timestamp'].unique()):
                 hm = f"{ts.hour:02d}:{ts.minute:02d}"
                 self._hm_cache[ts] = hm
 

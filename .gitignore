@@ -53,5 +53,9 @@ ca-cert
 # Docker
 *.log
 
+# docker-imputation runtime dirs
+phase-2/Imputation Module/docker-imputation/io/
+phase-2/Imputation Module/docker-imputation/cache/
+
 # Office documents
 *.docx

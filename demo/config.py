@@ -23,7 +23,10 @@ WEATHER_CSV = os.path.join(DATA_DIR, "2026 weather data.csv")
 HOLIDAYS_XLSX = os.path.join(MODEL_DIR, "Holidays.xlsx")
 
 # Mar 22 - Apr 10 2026 CSVs at project root, extending HISTORICAL_CSV.
-RECENT_HA_CSV = os.path.join(PROJECT_ROOT, "Cons_Hotel Academic_2026-03-22_2026-04-10.csv")
+RECENT_HA_CSV = os.environ.get(
+    "DEMO_RECENT_HA_CSV",
+    os.path.join(PROJECT_ROOT, "Cons_Hotel Academic_2026-03-22_2026-04-10.csv"),
+)
 RECENT_SITE_CSV = os.path.join(PROJECT_ROOT, "Cons_Historical Site_2026-03-22_2026-04-10.csv")
 
 BUILDING_COLUMN = "Ptot_HA"
