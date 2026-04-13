@@ -80,17 +80,26 @@ def extract_window(df, target_date, weather_df):
     """
     tz = pytz.timezone(TIMEZONE)
 
-    target_start = tz.localize(pd.Timestamp(target_date))
-    target_end = target_start + pd.Timedelta(hours=23, minutes=50)
-    history_start = target_start - pd.Timedelta(days=7)
+    # Work in UTC for filtering to avoid DST issues, then convert
+    # target timestamps to local time for feature engineering.
+    target_start_local = tz.localize(pd.Timestamp(target_date))
+    target_end_local = target_start_local + pd.Timedelta(hours=23, minutes=50)
+    history_start_local = target_start_local - pd.Timedelta(days=7)
 
-    # Localize CSV dates if needed (work on a copy to avoid side effects)
+    # Convert bounds to UTC for comparison
+    target_start_utc = target_start_local.astimezone(pytz.utc)
+    target_end_utc = target_end_local.astimezone(pytz.utc)
+    history_start_utc = history_start_local.astimezone(pytz.utc)
+
+    # Ensure Date column is UTC-aware
     df = df.copy()
     if df["Date"].dt.tz is None:
-        df["Date"] = df["Date"].dt.tz_localize("UTC").dt.tz_convert(tz)
+        df["Date"] = df["Date"].dt.tz_localize("UTC")
+    else:
+        df["Date"] = df["Date"].dt.tz_convert("UTC")
 
     # Extract 7-day history
-    mask_hist = (df["Date"] >= history_start) & (df["Date"] < target_start)
+    mask_hist = (df["Date"] >= history_start_utc) & (df["Date"] < target_start_utc)
     history = df.loc[mask_hist].copy().reset_index(drop=True)
 
     if len(history) < LOOKBACK_POINTS:
@@ -103,18 +112,20 @@ def extract_window(df, target_date, weather_df):
     if len(history) > LOOKBACK_POINTS:
         history = history.iloc[-LOOKBACK_POINTS:].reset_index(drop=True)
 
-    # Target day timestamps
+    # Target day timestamps in local time (for feature engineering in predict.py)
     target_timestamps = pd.date_range(
-        target_start, target_end, freq="10min"
+        target_start_local, target_end_local, freq="10min"
     ).tolist()
 
     # Weather for target day
     weather_df = weather_df.copy()
     if weather_df["Date"].dt.tz is None:
-        weather_df["Date"] = weather_df["Date"].dt.tz_localize("UTC").dt.tz_convert(tz)
+        weather_df["Date"] = weather_df["Date"].dt.tz_localize("UTC")
+    else:
+        weather_df["Date"] = weather_df["Date"].dt.tz_convert("UTC")
 
-    mask_weather = (weather_df["Date"] >= target_start) & (
-        weather_df["Date"] <= target_end
+    mask_weather = (weather_df["Date"] >= target_start_utc) & (
+        weather_df["Date"] <= target_end_utc
     )
     weather_slice = weather_df.loc[mask_weather]
 
@@ -126,7 +137,7 @@ def extract_window(df, target_date, weather_df):
             weather_temps[: len(weather_slice)] = weather_slice["AirTemp"].values
 
     # Actual target day consumption (for evaluation, if available)
-    mask_actual = (df["Date"] >= target_start) & (df["Date"] <= target_end)
+    mask_actual = (df["Date"] >= target_start_utc) & (df["Date"] <= target_end_utc)
     actual_slice = df.loc[mask_actual]
     actual_target = None
     if len(actual_slice) >= POINTS_PER_DAY:
