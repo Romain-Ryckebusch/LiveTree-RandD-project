@@ -100,17 +100,27 @@ def extract_window(df, target_date, weather_df):
 
     # Extract 7-day history
     mask_hist = (df["Date"] >= history_start_utc) & (df["Date"] < target_start_utc)
-    history = df.loc[mask_hist].copy().reset_index(drop=True)
+    history = df.loc[mask_hist].copy()
 
-    if len(history) < LOOKBACK_POINTS:
-        print(
-            f"Warning: only {len(history)} history points "
-            f"(expected {LOOKBACK_POINTS}). Proceeding anyway."
-        )
+    # Build a complete 10-min grid for the 7-day window.
+    # In CSV data, every timestamp has a row (missing values are NaN).
+    # In Cassandra, missing timestamps have no row at all.
+    # Reindexing against a full grid turns missing timestamps into NaN rows,
+    # so the imputer can detect and fill them.
+    full_grid = pd.date_range(
+        history_start_utc, periods=LOOKBACK_POINTS, freq="10min", tz="UTC"
+    )
+    history = (
+        history
+        .set_index("Date")
+        .reindex(full_grid)
+        .rename_axis("Date")
+        .reset_index()
+    )
 
-    # Truncate to exactly 1008
-    if len(history) > LOOKBACK_POINTS:
-        history = history.iloc[-LOOKBACK_POINTS:].reset_index(drop=True)
+    n_missing = history.iloc[:, 1:].isna().any(axis=1).sum()
+    if n_missing > 0:
+        print(f"Detected {n_missing} missing timestamps in 7-day window (real gaps)")
 
     # Target day timestamps in local time (for feature engineering in predict.py)
     target_timestamps = pd.date_range(
@@ -171,6 +181,16 @@ def run_reference(args):
     )
     print(f"History window: {len(history)} points")
 
+    # Impute real gaps if any (Cassandra data may have missing timestamps)
+    real_gaps = history[BUILDING_COLUMN].isna().sum()
+    if real_gaps > 0:
+        print(f"Imputing {real_gaps} real gaps before prediction")
+        real_imputed, _ = impute(
+            history[BUILDING_COLUMN],
+            history["Date"],
+        )
+        history[BUILDING_COLUMN] = real_imputed.values
+
     baseline_pred = predict_day(target_ts, weather, history)
     print(f"Predictions: min={baseline_pred.min():.0f}, max={baseline_pred.max():.0f}")
 
@@ -227,6 +247,18 @@ def run(args, hist_df=None, weather_df=None, quiet=False):
         hist_df, args.target_date, weather_df
     )
     log(f"History window: {len(history)} points")
+
+    # If data has real gaps (from Cassandra), impute them first
+    # so we have a complete baseline to predict from.
+    real_gaps = history[BUILDING_COLUMN].isna().sum()
+    if real_gaps > 0:
+        log(f"\n=== Imputing {real_gaps} real gaps before baseline ===")
+        real_imputed, _real_quality = impute(
+            history[BUILDING_COLUMN],
+            history["Date"],
+            random_seed=args.seed,
+        )
+        history[BUILDING_COLUMN] = real_imputed.values
 
     # Save clean history before gap injection
     history_clean = history[BUILDING_COLUMN].values.copy()
