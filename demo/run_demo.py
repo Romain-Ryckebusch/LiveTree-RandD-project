@@ -47,15 +47,21 @@ from plotting import (
 )
 
 
-def load_historical_data():
-    """Load and prepare the historical consumption CSV."""
+def load_historical_data(source="csv"):
+    """Load consumption data from CSV or Cassandra."""
+    if source == "cassandra":
+        from cassandra_client import load_historical_data_cassandra
+        return load_historical_data_cassandra()
     df = pd.read_csv(HISTORICAL_CSV, parse_dates=["Date"])
     df = df.sort_values("Date").reset_index(drop=True)
     return df
 
 
-def load_weather_data():
-    """Load the weather CSV."""
+def load_weather_data(source="csv"):
+    """Load weather data from CSV or Cassandra."""
+    if source == "cassandra":
+        from cassandra_client import load_weather_data_cassandra
+        return load_weather_data_cassandra()
     df = pd.read_csv(WEATHER_CSV, parse_dates=["Date"])
     df = df.sort_values("Date").reset_index(drop=True)
     return df
@@ -143,8 +149,8 @@ def run_reference(args):
     Produces the baseline prediction for the target date and saves it as CSV.
     """
     print("=== Reference prediction mode ===")
-    hist_df = load_historical_data()
-    weather_df = load_weather_data()
+    hist_df = load_historical_data(args.source)
+    weather_df = load_weather_data(args.source)
 
     print(f"Target date: {args.target_date}")
     print(f"Building: {BUILDING_COLUMN}")
@@ -195,11 +201,12 @@ def run(args, hist_df=None, weather_df=None, quiet=False):
         if not quiet:
             print(msg)
 
+    source = getattr(args, "source", "csv")
     if hist_df is None:
         log("Loading data...")
-        hist_df = load_historical_data()
+        hist_df = load_historical_data(source)
     if weather_df is None:
-        weather_df = load_weather_data()
+        weather_df = load_weather_data(source)
 
     label = getattr(args, "label", None) or _make_label(args)
     log(f"Target date: {args.target_date}")
@@ -387,6 +394,12 @@ def main():
         choices=["linear", "zero"],
         default="linear",
         help="Naive imputation method: 'linear' (interpolation) or 'zero' (zero-padding). Default: linear.",
+    )
+    parser.add_argument(
+        "--source",
+        choices=["csv", "cassandra"],
+        default=os.environ.get("DATA_SOURCE", "csv"),
+        help="Data source: 'csv' (local files) or 'cassandra' (database). Default: csv.",
     )
     args = parser.parse_args()
 
