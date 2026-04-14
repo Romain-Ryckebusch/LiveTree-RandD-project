@@ -6,13 +6,18 @@ services:
     image: rd-imputer:latest
     container_name: rd_imputer
     volumes:
-      # Historical + weather CSVs (read-only)
-      - ../../Data:/data:ro
-      # Recent HA CSV lives at the project root; bind-mount into a separate
-      # target dir (can't stack a file mount inside the read-only /data)
-      - "../../../Cons_Hotel Academic_2026-03-22_2026-04-10.csv:/recent/Cons_Hotel Academic_2026-03-22_2026-04-10.csv:ro"
+      # Historical + weather CSVs and the recent HA CSV (read-only)
+      - ../../data:/data:ro
       # Input/output exchange dir
       - ./io:/io
       # Persistent cache for hybrid_templates_cache.pkl
       - ./cache:/app/cache
-    command: ["--input", "/io/input.csv", "--output", "/io/output.csv"]
+    environment:
+      CASSANDRA_HOSTS: ${CASSANDRA_HOSTS:-127.0.0.1}
+      CASSANDRA_USERNAME: ${CASSANDRA_USERNAME:-}
+      CASSANDRA_PASSWORD: ${CASSANDRA_PASSWORD:-}
+      CASSANDRA_KEYSPACE: ${CASSANDRA_KEYSPACE:-previsions_data}
+    env_file:
+      - path: .env
+        required: false
+    command: ["--source", "csv", "--input", "/io/input.csv", "--output", "/io/output.csv"]
