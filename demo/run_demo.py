@@ -47,15 +47,21 @@ from plotting import (
 )
 
 
-def load_historical_data():
-    """Load and prepare the historical consumption CSV."""
+def load_historical_data(source="csv"):
+    """Load consumption data from CSV or Cassandra."""
+    if source == "cassandra":
+        from cassandra_client import load_historical_data_cassandra
+        return load_historical_data_cassandra()
     df = pd.read_csv(HISTORICAL_CSV, parse_dates=["Date"])
     df = df.sort_values("Date").reset_index(drop=True)
     return df
 
 
-def load_weather_data():
-    """Load the weather CSV."""
+def load_weather_data(source="csv"):
+    """Load weather data from CSV or Cassandra."""
+    if source == "cassandra":
+        from cassandra_client import load_weather_data_cassandra
+        return load_weather_data_cassandra()
     df = pd.read_csv(WEATHER_CSV, parse_dates=["Date"])
     df = df.sort_values("Date").reset_index(drop=True)
     return df
@@ -74,41 +80,62 @@ def extract_window(df, target_date, weather_df):
     """
     tz = pytz.timezone(TIMEZONE)
 
-    target_start = tz.localize(pd.Timestamp(target_date))
-    target_end = target_start + pd.Timedelta(hours=23, minutes=50)
-    history_start = target_start - pd.Timedelta(days=7)
+    # Work in UTC for filtering to avoid DST issues, then convert
+    # target timestamps to local time for feature engineering.
+    target_start_local = tz.localize(pd.Timestamp(target_date))
+    target_end_local = target_start_local + pd.Timedelta(hours=23, minutes=50)
+    history_start_local = target_start_local - pd.Timedelta(days=7)
 
-    # Localize CSV dates if needed (work on a copy to avoid side effects)
+    # Convert bounds to UTC for comparison
+    target_start_utc = target_start_local.astimezone(pytz.utc)
+    target_end_utc = target_end_local.astimezone(pytz.utc)
+    history_start_utc = history_start_local.astimezone(pytz.utc)
+
+    # Ensure Date column is UTC-aware
     df = df.copy()
     if df["Date"].dt.tz is None:
-        df["Date"] = df["Date"].dt.tz_localize("UTC").dt.tz_convert(tz)
+        df["Date"] = df["Date"].dt.tz_localize("UTC")
+    else:
+        df["Date"] = df["Date"].dt.tz_convert("UTC")
 
     # Extract 7-day history
-    mask_hist = (df["Date"] >= history_start) & (df["Date"] < target_start)
-    history = df.loc[mask_hist].copy().reset_index(drop=True)
+    mask_hist = (df["Date"] >= history_start_utc) & (df["Date"] < target_start_utc)
+    history = df.loc[mask_hist].copy()
 
-    if len(history) < LOOKBACK_POINTS:
-        print(
-            f"Warning: only {len(history)} history points "
-            f"(expected {LOOKBACK_POINTS}). Proceeding anyway."
-        )
+    # Build a complete 10-min grid for the 7-day window.
+    # In CSV data, every timestamp has a row (missing values are NaN).
+    # In Cassandra, missing timestamps have no row at all.
+    # Reindexing against a full grid turns missing timestamps into NaN rows,
+    # so the imputer can detect and fill them.
+    full_grid = pd.date_range(
+        history_start_utc, periods=LOOKBACK_POINTS, freq="10min", tz="UTC"
+    )
+    history = (
+        history
+        .set_index("Date")
+        .reindex(full_grid)
+        .rename_axis("Date")
+        .reset_index()
+    )
 
-    # Truncate to exactly 1008
-    if len(history) > LOOKBACK_POINTS:
-        history = history.iloc[-LOOKBACK_POINTS:].reset_index(drop=True)
+    n_missing = history.iloc[:, 1:].isna().any(axis=1).sum()
+    if n_missing > 0:
+        print(f"Detected {n_missing} missing timestamps in 7-day window (real gaps)")
 
-    # Target day timestamps
+    # Target day timestamps in local time (for feature engineering in predict.py)
     target_timestamps = pd.date_range(
-        target_start, target_end, freq="10min"
+        target_start_local, target_end_local, freq="10min"
     ).tolist()
 
     # Weather for target day
     weather_df = weather_df.copy()
     if weather_df["Date"].dt.tz is None:
-        weather_df["Date"] = weather_df["Date"].dt.tz_localize("UTC").dt.tz_convert(tz)
+        weather_df["Date"] = weather_df["Date"].dt.tz_localize("UTC")
+    else:
+        weather_df["Date"] = weather_df["Date"].dt.tz_convert("UTC")
 
-    mask_weather = (weather_df["Date"] >= target_start) & (
-        weather_df["Date"] <= target_end
+    mask_weather = (weather_df["Date"] >= target_start_utc) & (
+        weather_df["Date"] <= target_end_utc
     )
     weather_slice = weather_df.loc[mask_weather]
 
@@ -120,7 +147,7 @@ def extract_window(df, target_date, weather_df):
             weather_temps[: len(weather_slice)] = weather_slice["AirTemp"].values
 
     # Actual target day consumption (for evaluation, if available)
-    mask_actual = (df["Date"] >= target_start) & (df["Date"] <= target_end)
+    mask_actual = (df["Date"] >= target_start_utc) & (df["Date"] <= target_end_utc)
     actual_slice = df.loc[mask_actual]
     actual_target = None
     if len(actual_slice) >= POINTS_PER_DAY:
@@ -143,8 +170,8 @@ def run_reference(args):
     Produces the baseline prediction for the target date and saves it as CSV.
     """
     print("=== Reference prediction mode ===")
-    hist_df = load_historical_data()
-    weather_df = load_weather_data()
+    hist_df = load_historical_data(args.source)
+    weather_df = load_weather_data(args.source)
 
     print(f"Target date: {args.target_date}")
     print(f"Building: {BUILDING_COLUMN}")
@@ -153,6 +180,16 @@ def run_reference(args):
         hist_df, args.target_date, weather_df
     )
     print(f"History window: {len(history)} points")
+
+    # Impute real gaps if any (Cassandra data may have missing timestamps)
+    real_gaps = history[BUILDING_COLUMN].isna().sum()
+    if real_gaps > 0:
+        print(f"Imputing {real_gaps} real gaps before prediction")
+        real_imputed, _ = impute(
+            history[BUILDING_COLUMN],
+            history["Date"],
+        )
+        history[BUILDING_COLUMN] = real_imputed.values
 
     baseline_pred = predict_day(target_ts, weather, history)
     print(f"Predictions: min={baseline_pred.min():.0f}, max={baseline_pred.max():.0f}")
@@ -195,11 +232,12 @@ def run(args, hist_df=None, weather_df=None, quiet=False):
         if not quiet:
             print(msg)
 
+    source = getattr(args, "source", "csv")
     if hist_df is None:
         log("Loading data...")
-        hist_df = load_historical_data()
+        hist_df = load_historical_data(source)
     if weather_df is None:
-        weather_df = load_weather_data()
+        weather_df = load_weather_data(source)
 
     label = getattr(args, "label", None) or _make_label(args)
     log(f"Target date: {args.target_date}")
@@ -209,6 +247,18 @@ def run(args, hist_df=None, weather_df=None, quiet=False):
         hist_df, args.target_date, weather_df
     )
     log(f"History window: {len(history)} points")
+
+    # If data has real gaps (from Cassandra), impute them first
+    # so we have a complete baseline to predict from.
+    real_gaps = history[BUILDING_COLUMN].isna().sum()
+    if real_gaps > 0:
+        log(f"\n=== Imputing {real_gaps} real gaps before baseline ===")
+        real_imputed, _real_quality = impute(
+            history[BUILDING_COLUMN],
+            history["Date"],
+            random_seed=args.seed,
+        )
+        history[BUILDING_COLUMN] = real_imputed.values
 
     # Save clean history before gap injection
     history_clean = history[BUILDING_COLUMN].values.copy()
@@ -387,6 +437,12 @@ def main():
         choices=["linear", "zero"],
         default="linear",
         help="Naive imputation method: 'linear' (interpolation) or 'zero' (zero-padding). Default: linear.",
+    )
+    parser.add_argument(
+        "--source",
+        choices=["csv", "cassandra"],
+        default=os.environ.get("DATA_SOURCE", "csv"),
+        help="Data source: 'csv' (local files) or 'cassandra' (database). Default: csv.",
     )
     args = parser.parse_args()
 

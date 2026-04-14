@@ -10,3 +10,4 @@ h5py==2.10.0
 xlrd==1.2.0
 openpyxl==3.0.5
 matplotlib==3.3.0
+cassandra-driver==3.24.0
