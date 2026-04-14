@@ -10,10 +10,10 @@
 *.save
 *.joblib
 # But allow the production models we need for the pipeline
-!2nd Phase/Prediction Model/**/my_modelCons*.h5
-!2nd Phase/Prediction Model/**/scalerConso*.save
-!2nd Phase/Prediction Model/**/scalerxConso*.save
-!2nd Phase/Prediction Model/**/Holidays*.xlsx
+!phase-2/Prediction Model/**/my_modelCons*.h5
+!phase-2/Prediction Model/**/scalerConso*.save
+!phase-2/Prediction Model/**/scalerxConso*.save
+!phase-2/Prediction Model/**/Holidays*.xlsx
 
 # Python
 __pycache__/
