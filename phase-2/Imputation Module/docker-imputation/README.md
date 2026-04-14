@@ -1,14 +1,10 @@
 # docker-imputation
 
-Standalone Docker container that wraps the project's imputation module
-(`demo/imputer.py`, backed by `TemperatureAwareHybridEngine`). It takes a
-7-day window of holed `Ptot_HA` consumption data as a CSV and returns the
-imputed series plus per-point quality flags.
-
-This is the first packaging step of the Phase 2 "module de pilotage". The
-container's `impute_cli.py` is a thin wrapper; the canonical imputation code
-stays in `demo/`. A future Kafka consumer entry point can live in the same
-image without touching the imputation logic (see *Forward path* below).
+Standalone Docker container for the Phase 2 **module de pilotage**. Wraps
+`phase-2/Imputation Module/src/imputer.py` (backed by
+`TemperatureAwareHybridEngine`) and feeds it either a CSV of a 7-day
+`Ptot_HA` window or a live pull from the production Cassandra cluster.
+Returns the imputed series plus per-point quality flags.
 
 ## Build
 
@@ -17,24 +13,44 @@ cd "phase-2/Imputation Module/docker-imputation"
 docker compose build
 ```
 
-The build context is the project root (so the Dockerfile can `COPY` from
-both `demo/` and this directory). First build is ~3-5 minutes; subsequent
+The build context is the project root so the Dockerfile can `COPY` from
+`phase-2/Imputation Module/src/`. First build is ~3-5 minutes; subsequent
 builds reuse the pip layer.
 
 ## Run
 
+### CSV mode (offline / reproducible)
+
 Place your input CSV at `./io/input.csv`, then:
 
 ```bash
-docker compose run --rm imputer --input /io/input.csv --output /io/output.csv --seed 42
+docker compose run --rm imputer --source csv --input /io/input.csv --output /io/output.csv --seed 42
 ```
 
 On success: `[OK] Imputed N gap point(s) -> /io/output.csv` and exit 0.
 On any validation or runtime error: an `ERROR: ...` line on stderr and exit 1.
 
+### Cassandra mode (production pull)
+
+Point the container at a reachable Cassandra cluster and name the target
+date. The 7-day window ending the day **before** `--target-date` will be
+pulled and imputed:
+
+```bash
+CASSANDRA_HOSTS=10.64.253.10,10.64.253.11,10.64.253.12 \
+  docker compose run --rm imputer \
+    --source cassandra \
+    --target-date 2026-04-10 \
+    --output /io/output.csv
+```
+
+Credentials and keyspace are optional; see *Configuration via env vars*
+below. You can also keep them in a local `.env` next to `docker-compose.yml`
+(already allowed via `env_file: required: false`).
+
 ## I/O contract
 
-### Input CSV (`/io/input.csv`)
+### CSV mode input (`/io/input.csv`)
 
 | Column      | Type   | Notes                                                                |
 |-------------|--------|----------------------------------------------------------------------|
@@ -46,11 +62,24 @@ Constraints (CLI exits non-zero on violation):
 - Timestamps strictly increasing on a 10-minute grid (1-second tolerance).
 - At least one non-NaN value.
 
+### Cassandra mode input
+
+No input file. The container reads from the tables listed in
+`phase-2/Imputation Module/src/config.py`:
+
+- `conso_historiques_clean` (partition key `Conso_Data`)
+- `pv_prev_meteo_clean` (partition key `Meteorological_Prevision_Data`)
+
+The 7-day window is reindexed onto a complete 10-minute grid so that
+missing rows in Cassandra become NaN gaps the imputer can detect.
+
 ### Output CSV (`/io/output.csv`)
+
+Same contract in both modes:
 
 | Column      | Type   | Notes                                                                |
 |-------------|--------|----------------------------------------------------------------------|
-| `timestamp` | string | Echoed verbatim from the input.                                      |
+| `timestamp` | string | Echoed from the input (CSV) or ISO 8601 UTC (Cassandra).             |
 | `value`     | float  | Imputed series. No NaN remain.                                       |
 | `quality`   | int    | Per-point imputation strategy (see legend).                          |
 
@@ -65,48 +94,49 @@ Constraints (CLI exits non-zero on violation):
 
 ## Mounts
 
-`docker-compose.yml` wires up four volumes:
+`docker-compose.yml` wires up three volumes:
 
-| Host path                                                       | Container path                                            | Mode |
-|-----------------------------------------------------------------|-----------------------------------------------------------|------|
-| `phase-2/Data/`                                                 | `/data/`                                                  | ro   |
-| `Cons_Hotel Academic_2026-03-22_2026-04-10.csv` (project root)  | `/recent/Cons_Hotel Academic_2026-03-22_2026-04-10.csv`   | ro   |
-| `./io/`                                                         | `/io/`                                                    | rw   |
-| `./cache/`                                                      | `/app/cache/`                                             | rw   |
+| Host path                               | Container path  | Mode |
+|-----------------------------------------|-----------------|------|
+| `phase-2/data/`                         | `/data/`        | ro   |
+| `./io/`                                 | `/io/`          | rw   |
+| `./cache/`                              | `/app/cache/`   | rw   |
 
-(The recent HA CSV mounts into `/recent/` rather than `/data/` because Docker
-can't nest a file bind-mount inside a read-only directory mount.)
-
-The historical CSVs in `/data/` are needed because `imputer.py` extends the
-input window with 56 days of prior `Ptot_HA` history before calling the
-hybrid engine (the long-gap ensemble strategies need that lookback to
-calibrate).
+The historical CSVs in `/data/` are needed for **CSV-mode** runs and as a
+fallback for the 56-day history prepend in CSV mode. In Cassandra mode the
+56-day context is drawn from the same pull as the 7-day window and the
+CSVs are only consulted if the Cassandra pull is empty.
 
 `./cache/` persists `hybrid_templates_cache.pkl` so the engine doesn't
 rebuild seasonal templates on every run.
 
 ## Configuration via env vars
 
-The container sets these so `demo/config.py` resolves paths inside the
-container instead of relative to a project root:
+Paths inside the container:
+- `IMPUTER_DATA_DIR=/data`
+- `IMPUTER_RECENT_HA_CSV=/data/Cons_Hotel Academic_2026-03-22_2026-04-10.csv`
+- `IMPUTER_OUTPUT_DIR=/app/cache`
 
-- `DEMO_DATA_DIR=/data`
-- `DEMO_RECENT_HA_CSV=/data/Cons_Hotel Academic_2026-03-22_2026-04-10.csv`
-- `DEMO_OUTPUT_DIR=/app/cache`
+Cassandra connection (defaults in parentheses):
+- `CASSANDRA_HOSTS` (`127.0.0.1`): comma-separated list of contact points
+- `CASSANDRA_USERNAME` (empty, skips auth)
+- `CASSANDRA_PASSWORD` (empty)
+- `CASSANDRA_KEYSPACE` (`previsions_data`)
 
-Override any of them by editing `docker-compose.yml` if your data lives
-elsewhere.
+Override any of them on the command line (`-e VAR=value`), via the shell
+environment (compose picks them up), or through a local `.env` file next
+to `docker-compose.yml`.
 
 ## Forward path
 
-When the production pipeline is wired to Kafka/Cassandra, add a second
-entry script `src/kafka_consumer.py` that:
+When the production pipeline is wired to Kafka, add a second entry script
+`src/kafka_consumer.py` that:
 
 1. Subscribes to a holed-window topic.
 2. Calls `from imputer import impute` (the engine stays warm in the
-   long-running process — much faster than one-shot CLI invocations).
+   long-running process, much faster than one-shot CLI invocations).
 3. Publishes the imputed window back to Kafka or writes directly to
-   Cassandra.
+   Cassandra via `cassandra_client`.
 
 No changes to `imputer.py`, `hybrid_engine.py`, or this Dockerfile will be
 needed. The only addition would be a `kafka-python` (or Confluent) entry in
