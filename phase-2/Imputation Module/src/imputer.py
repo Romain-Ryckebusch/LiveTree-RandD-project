@@ -1,6 +1,4 @@
-"""Adapter wrapping TemperatureAwareHybridEngine for the single-building demo."""
-from __future__ import annotations
-
+"""Adapter wrapping TemperatureAwareHybridEngine for the Ptot_HA pilotage module."""
 import contextlib
 import io
 import os
@@ -21,8 +19,7 @@ from hybrid_engine import TemperatureAwareHybridEngine
 
 
 def _to_window_time(ts: pd.Series) -> pd.Series:
-    # Mirror run_demo.extract_window: UTC -> Paris -> tz-naive. Skipping this
-    # offsets the historical extension relative to the input window.
+    # Match window.extract_window's tz handling (UTC -> Paris -> naive).
     if ts.dt.tz is None:
         return ts.dt.tz_localize("UTC").dt.tz_convert(TIMEZONE).dt.tz_localize(None)
     return ts.dt.tz_convert(TIMEZONE).dt.tz_localize(None)
@@ -32,9 +29,29 @@ _ENGINE: Optional[TemperatureAwareHybridEngine] = None
 _WEATHER: Optional[pd.DataFrame] = None
 _HISTORY_CACHE: Optional[pd.DataFrame] = None
 
-# 8 weeks = the longest lookback the engine's ensemble methods use. Less
-# than this and the long-gap ensemble degenerates and the engine collapses
-# the gap to a flat constant via its >40% validation fallback.
+
+def set_history_source(df: Optional[pd.DataFrame]) -> None:
+    """Inject a pre-loaded Ptot_HA history instead of reading CSVs.
+
+    Used by the Cassandra CLI path. Pass None or an empty frame to reset.
+    """
+    global _HISTORY_CACHE, _ENGINE
+    if df is None or df.empty:
+        _HISTORY_CACHE = pd.DataFrame(columns=["Timestamp", "Ptot_HA"])
+    else:
+        cleaned = df[["Timestamp", "Ptot_HA"]].copy()
+        cleaned["Timestamp"] = _to_window_time(cleaned["Timestamp"])
+        cleaned = (
+            cleaned.dropna(subset=["Timestamp"])
+            .drop_duplicates(subset=["Timestamp"], keep="last")
+            .sort_values("Timestamp")
+            .reset_index(drop=True)
+        )
+        _HISTORY_CACHE = cleaned
+    # Drop cached engine so the new history is picked up.
+    _ENGINE = None
+
+# 8 weeks: minimum context the long-gap ensemble needs before its >40% fallback kicks in.
 _PREPEND_DAYS = 56
 
 _STRATEGY_FLAG_MAP = {
@@ -89,7 +106,6 @@ def _load_combined_ha_history() -> pd.DataFrame:
 
 
 def _extend_with_history(df_in: pd.DataFrame) -> pd.DataFrame:
-    # See _PREPEND_DAYS comment above for why we need 56 days of context.
     hist = _load_combined_ha_history()
     if hist.empty:
         return df_in
@@ -156,7 +172,7 @@ def impute(
     random_seed: Optional[int] = None,
     **_kwargs,
 ):
-    """Route the demo single-series API through TemperatureAwareHybridEngine."""
+    """Single-series entry point routed through TemperatureAwareHybridEngine."""
     s = pd.Series(series).reset_index(drop=True)
     if isinstance(date_index, pd.DatetimeIndex):
         dt = pd.Series(date_index)
@@ -176,9 +192,8 @@ def impute(
 
     df_in = _extend_with_history(df_window)
     window_start_ts = pd.Timestamp(dt_naive.iloc[0])
-    # Engine reindexes to a 10-min grid floored on min(Timestamp); use the
-    # floored extension start (not the row count) to map strategy-log indices
-    # back into the window.
+    # Engine reindexes to a 10-min grid floored on min(Timestamp).
+    # Use the floored start for strategy-log offset alignment.
     extension_start_ts = df_in["Timestamp"].min().floor("10min")
     extension_len = int(
         (window_start_ts - extension_start_ts) / pd.Timedelta(minutes=10)
