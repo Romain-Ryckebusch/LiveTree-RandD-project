@@ -17,9 +17,15 @@ from config import (
 )
 
 
-def extract_window(df, target_date, weather_df):
+def extract_window(df, target_date, weather_df, building_column=None):
     """
     Extract the 7-day history window and target-day weather for a given date.
+
+    Parameters
+    ----------
+    building_column : str, optional
+        Consumption column to slice for the actual-target readback. Defaults
+        to config.BUILDING_COLUMN when not provided.
 
     Returns
     -------
@@ -28,6 +34,7 @@ def extract_window(df, target_date, weather_df):
     weather_temps : array (144)
     actual_target : array (144) or None
     """
+    target_column = building_column or BUILDING_COLUMN
     tz = pytz.timezone(TIMEZONE)
 
     target_start_local = tz.localize(pd.Timestamp(target_date))
@@ -90,6 +97,6 @@ def extract_window(df, target_date, weather_df):
     actual_slice = df.loc[mask_actual]
     actual_target = None
     if len(actual_slice) >= POINTS_PER_DAY:
-        actual_target = actual_slice[BUILDING_COLUMN].values[:POINTS_PER_DAY]
+        actual_target = actual_slice[target_column].values[:POINTS_PER_DAY]
 
     return history, target_timestamps, weather_temps, actual_target

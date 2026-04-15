@@ -40,9 +40,11 @@ class TemperatureAwareHybridEngine:
         weather_df: Optional[pd.DataFrame] = None,
         use_historical_data: bool = True,
         template_cache_file: str = 'templates_cache.pkl',
+        low_variance_threshold: float = 5000.0,
     ):
         self.site_cols = site_cols or SITE_COLS
         self.weather_df = weather_df
+        self.low_variance_threshold = low_variance_threshold
         self.holidays = FRANCE_HOLIDAYS_2026
         self.close_days = FRANCE_CLOSE_DAYS_2026   # Site-specific closures (near-zero load)
         self.special_days = FRANCE_SPECIAL_DAYS_2026  # Special patterns (bridges, academic)
@@ -804,7 +806,7 @@ class TemperatureAwareHybridEngine:
                 
                 if len(hourly_similar) >= 8:
                     hourly_std = np.std(hourly_similar)
-                    is_smooth_day = hourly_std < 5000  # Flat if std dev < 5000 kW
+                    is_smooth_day = hourly_std < self.low_variance_threshold
 
         # Base confidences (FIX #11: percentile bounds inside _assess_method_confidence)
         confidences = {

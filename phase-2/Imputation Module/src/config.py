@@ -21,6 +21,16 @@ RECENT_HA_CSV = os.environ.get(
 )
 
 BUILDING_COLUMN = "Ptot_HA"
+BUILDINGS = [
+    "Ptot_HA",
+    "Ptot_HEI_13RT",
+    "Ptot_HEI_5RNS",
+    "Ptot_RIZOMM",
+    "Ptot_Campus",
+]
+CAMPUS_COMPONENTS = BUILDINGS[:4]
+LOW_VARIANCE_AUTO_FRACTION = 0.05
+LOW_VARIANCE_FLOOR_W = 100.0
 
 POINTS_PER_DAY = 144
 LOOKBACK_DAYS = 7

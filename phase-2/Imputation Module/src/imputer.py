@@ -1,8 +1,12 @@
-"""Adapter wrapping TemperatureAwareHybridEngine for the Ptot_HA pilotage module."""
+"""Adapter wrapping TemperatureAwareHybridEngine for the pilotage module.
+
+Caller passes ``building_column`` through set_history_source and impute;
+engine and history caches are keyed by that column name.
+"""
 import contextlib
 import io
 import os
-from typing import Optional
+from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -10,6 +14,8 @@ import pandas as pd
 from config import (
     BUILDING_COLUMN,
     HISTORICAL_CSV,
+    LOW_VARIANCE_AUTO_FRACTION,
+    LOW_VARIANCE_FLOOR_W,
     OUTPUT_DIR,
     RECENT_HA_CSV,
     TIMEZONE,
@@ -25,21 +31,22 @@ def _to_window_time(ts: pd.Series) -> pd.Series:
     return ts.dt.tz_convert(TIMEZONE).dt.tz_localize(None)
 
 
-_ENGINE: Optional[TemperatureAwareHybridEngine] = None
+_ENGINE: Dict[str, TemperatureAwareHybridEngine] = {}
 _WEATHER: Optional[pd.DataFrame] = None
-_HISTORY_CACHE: Optional[pd.DataFrame] = None
+_HISTORY_CACHE: Dict[str, pd.DataFrame] = {}
 
 
-def set_history_source(df: Optional[pd.DataFrame]) -> None:
-    """Inject a pre-loaded Ptot_HA history instead of reading CSVs.
+def set_history_source(df: Optional[pd.DataFrame], building_column: str) -> None:
+    """Inject a pre-loaded history for ``building_column`` instead of reading CSVs.
 
     Used by the Cassandra CLI path. Pass None or an empty frame to reset.
     """
-    global _HISTORY_CACHE, _ENGINE
     if df is None or df.empty:
-        _HISTORY_CACHE = pd.DataFrame(columns=["Timestamp", "Ptot_HA"])
+        _HISTORY_CACHE[building_column] = pd.DataFrame(
+            columns=["Timestamp", building_column]
+        )
     else:
-        cleaned = df[["Timestamp", "Ptot_HA"]].copy()
+        cleaned = df[["Timestamp", building_column]].copy()
         cleaned["Timestamp"] = _to_window_time(cleaned["Timestamp"])
         cleaned = (
             cleaned.dropna(subset=["Timestamp"])
@@ -47,9 +54,9 @@ def set_history_source(df: Optional[pd.DataFrame]) -> None:
             .sort_values("Timestamp")
             .reset_index(drop=True)
         )
-        _HISTORY_CACHE = cleaned
+        _HISTORY_CACHE[building_column] = cleaned
     # Drop cached engine so the new history is picked up.
-    _ENGINE = None
+    _ENGINE.pop(building_column, None)
 
 # 8 weeks: minimum context the long-gap ensemble needs before its >40% fallback kicks in.
 _PREPEND_DAYS = 56
@@ -73,10 +80,16 @@ def _flag_for_strategy(strategy: str) -> int:
     return _STRATEGY_FLAG_MAP.get(strategy, 2)
 
 
-def _load_combined_ha_history() -> pd.DataFrame:
-    global _HISTORY_CACHE
-    if _HISTORY_CACHE is not None:
-        return _HISTORY_CACHE
+def _load_combined_history(building_column: str) -> pd.DataFrame:
+    cached = _HISTORY_CACHE.get(building_column)
+    if cached is not None:
+        return cached
+
+    # CSV fallback only has Ptot_HA. Other buildings must be seeded from Cassandra.
+    if building_column != "Ptot_HA":
+        empty = pd.DataFrame(columns=["Timestamp", building_column])
+        _HISTORY_CACHE[building_column] = empty
+        return empty
 
     pieces = []
     for path in (HISTORICAL_CSV, RECENT_HA_CSV):
@@ -90,8 +103,9 @@ def _load_combined_ha_history() -> pd.DataFrame:
             df[["Date", "Ptot_HA"]].rename(columns={"Date": "Timestamp"})
         )
     if not pieces:
-        _HISTORY_CACHE = pd.DataFrame(columns=["Timestamp", "Ptot_HA"])
-        return _HISTORY_CACHE
+        empty = pd.DataFrame(columns=["Timestamp", "Ptot_HA"])
+        _HISTORY_CACHE["Ptot_HA"] = empty
+        return empty
 
     combined = pd.concat(pieces, ignore_index=True)
     combined["Timestamp"] = _to_window_time(combined["Timestamp"])
@@ -101,12 +115,12 @@ def _load_combined_ha_history() -> pd.DataFrame:
         .sort_values("Timestamp")
         .reset_index(drop=True)
     )
-    _HISTORY_CACHE = combined
+    _HISTORY_CACHE["Ptot_HA"] = combined
     return combined
 
 
-def _extend_with_history(df_in: pd.DataFrame) -> pd.DataFrame:
-    hist = _load_combined_ha_history()
+def _extend_with_history(df_in: pd.DataFrame, building_column: str) -> pd.DataFrame:
+    hist = _load_combined_history(building_column)
     if hist.empty:
         return df_in
 
@@ -114,12 +128,9 @@ def _extend_with_history(df_in: pd.DataFrame) -> pd.DataFrame:
     extension_start = window_start - pd.Timedelta(days=_PREPEND_DAYS)
 
     mask = (hist["Timestamp"] >= extension_start) & (hist["Timestamp"] < window_start)
-    extension = hist.loc[mask, ["Timestamp", "Ptot_HA"]].copy()
+    extension = hist.loc[mask, ["Timestamp", building_column]].copy()
     if extension.empty:
         return df_in
-
-    if BUILDING_COLUMN != "Ptot_HA":
-        extension = extension.rename(columns={"Ptot_HA": BUILDING_COLUMN})
 
     extended = pd.concat([extension, df_in], ignore_index=True, sort=False)
     extended = (
@@ -130,23 +141,38 @@ def _extend_with_history(df_in: pd.DataFrame) -> pd.DataFrame:
     return extended
 
 
-def _get_engine() -> TemperatureAwareHybridEngine:
-    global _ENGINE
-    if _ENGINE is None:
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-        cache_path = os.path.join(OUTPUT_DIR, "hybrid_templates_cache.pkl")
-        with contextlib.redirect_stdout(io.StringIO()):
-            _ENGINE = TemperatureAwareHybridEngine(
-                site_cols=[BUILDING_COLUMN],
-                weather_df=None,
-                use_historical_data=False,  # skip the missing 2021-2025 path
-                template_cache_file=cache_path,
-            )
-        hist = _load_combined_ha_history()
-        if not hist.empty:
-            _ENGINE.use_historical_data = True
-            _ENGINE.historical_df = hist
-    return _ENGINE
+def _auto_low_variance_threshold(hist: pd.DataFrame, building_column: str) -> float:
+    if hist.empty or building_column not in hist.columns:
+        return 5000.0
+    values = pd.to_numeric(hist[building_column], errors="coerce").to_numpy()
+    median_abs = float(np.nanmedian(np.abs(values)))
+    if not np.isfinite(median_abs) or median_abs <= 0:
+        return 5000.0
+    return max(LOW_VARIANCE_AUTO_FRACTION * median_abs, LOW_VARIANCE_FLOOR_W)
+
+
+def _get_engine(building_column: str) -> TemperatureAwareHybridEngine:
+    if building_column in _ENGINE:
+        return _ENGINE[building_column]
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    cache_path = os.path.join(
+        OUTPUT_DIR, f"hybrid_templates_cache_{building_column}.pkl"
+    )
+    hist = _load_combined_history(building_column)
+    low_var = _auto_low_variance_threshold(hist, building_column)
+    with contextlib.redirect_stdout(io.StringIO()):
+        engine = TemperatureAwareHybridEngine(
+            site_cols=[building_column],
+            weather_df=None,
+            use_historical_data=False,  # skip the missing 2021-2025 path
+            template_cache_file=cache_path,
+            low_variance_threshold=low_var,
+        )
+    if not hist.empty:
+        engine.use_historical_data = True
+        engine.historical_df = hist
+    _ENGINE[building_column] = engine
+    return engine
 
 
 def _get_weather_df() -> pd.DataFrame:
@@ -170,9 +196,11 @@ def impute(
     *,
     large_gap_min: int = 144,
     random_seed: Optional[int] = None,
+    building_column: Optional[str] = None,
     **_kwargs,
 ):
     """Single-series entry point routed through TemperatureAwareHybridEngine."""
+    bcol = building_column or BUILDING_COLUMN
     s = pd.Series(series).reset_index(drop=True)
     if isinstance(date_index, pd.DatetimeIndex):
         dt = pd.Series(date_index)
@@ -187,10 +215,10 @@ def impute(
 
     initial_na = s.isna().to_numpy()
     df_window = pd.DataFrame(
-        {"Timestamp": dt_naive, BUILDING_COLUMN: s.to_numpy(dtype=float)}
+        {"Timestamp": dt_naive, bcol: s.to_numpy(dtype=float)}
     )
 
-    df_in = _extend_with_history(df_window)
+    df_in = _extend_with_history(df_window, bcol)
     window_start_ts = pd.Timestamp(dt_naive.iloc[0])
     # Engine reindexes to a 10-min grid floored on min(Timestamp).
     # Use the floored start for strategy-log offset alignment.
@@ -199,7 +227,7 @@ def impute(
         (window_start_ts - extension_start_ts) / pd.Timedelta(minutes=10)
     )
 
-    engine = _get_engine()
+    engine = _get_engine(bcol)
     weather = _get_weather_df()
     weather_arg = weather if not weather.empty else None
 
@@ -212,7 +240,7 @@ def impute(
         .reindex(pd.to_datetime(dt_naive.values))
         .reset_index()
     )
-    imputed_vals = out_df[BUILDING_COLUMN].to_numpy(dtype=float)
+    imputed_vals = out_df[bcol].to_numpy(dtype=float)
 
     if np.isnan(imputed_vals).any():
         imputed_vals = (

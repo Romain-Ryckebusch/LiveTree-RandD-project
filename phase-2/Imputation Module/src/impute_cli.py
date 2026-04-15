@@ -3,7 +3,8 @@
 Reads a 7-day window of holed consumption data from a CSV (--source csv) or
 pulls it from Cassandra (--source cassandra), runs the
 TemperatureAwareHybridEngine via imputer.impute, and writes the imputed
-series plus per-point quality flags to a CSV.
+series plus per-point quality flags to a CSV. --building picks the Cassandra
+column to reconstruct; Ptot_Campus is the sum of the four buildings.
 """
 import argparse
 import sys
@@ -72,11 +73,13 @@ def load_input(path):
     return df, timestamp_strings
 
 
-def load_cassandra_window(target_date):
+def load_cassandra_window(target_date, building_column):
     """Pull history + weather from Cassandra and extract the 7-day window.
 
-    Returns the same (df, timestamp_strings) tuple as load_input.
-    Also seeds imputer's history cache from the Cassandra pull.
+    Returns the same (df, timestamp_strings) tuple as load_input, and seeds
+    imputer's history cache for ``building_column``. For Ptot_Campus the
+    column is built as the sum of the four buildings with skipna=False, so a
+    single missing component leaves the row missing.
     """
     try:
         from cassandra_client import (
@@ -96,12 +99,26 @@ def load_cassandra_window(target_date):
     except Exception as exc:
         fail(f"could not load weather from Cassandra: {type(exc).__name__}: {exc}")
 
-    from config import BUILDING_COLUMN
+    from config import CAMPUS_COMPONENTS
     from window import extract_window
+
+    if building_column == "Ptot_Campus":
+        missing_components = [c for c in CAMPUS_COMPONENTS if c not in hist_df.columns]
+        if missing_components:
+            fail(
+                f"Cassandra is missing Campus component columns: {missing_components}"
+            )
+        hist_df = hist_df.copy()
+        hist_df["Ptot_Campus"] = hist_df[CAMPUS_COMPONENTS].sum(axis=1, skipna=False)
+    elif building_column not in hist_df.columns:
+        fail(
+            f"Cassandra conso table does not contain column '{building_column}'. "
+            f"Available: {sorted(c for c in hist_df.columns if c.startswith('Ptot_'))}"
+        )
 
     try:
         history, _target_ts, _weather, _actual = extract_window(
-            hist_df, target_date, weather_df
+            hist_df, target_date, weather_df, building_column=building_column
         )
     except Exception as exc:
         fail(f"extract_window failed for {target_date}: {type(exc).__name__}: {exc}")
@@ -111,25 +128,28 @@ def load_cassandra_window(target_date):
             f"Cassandra window for {target_date} has {len(history)} rows, "
             f"expected {EXPECTED_ROWS}"
         )
-    if history[BUILDING_COLUMN].isna().all():
+    if history[building_column].isna().all():
         fail(
-            f"Cassandra window for {target_date} has no Ptot_HA values at all"
+            f"Cassandra window for {target_date} has no {building_column} values at all"
         )
 
     # Seed the engine's 56-day history from the Cassandra pull.
     imputer.set_history_source(
-        hist_df.rename(columns={"Date": "Timestamp"})[["Timestamp", BUILDING_COLUMN]]
+        hist_df.rename(columns={"Date": "Timestamp"})[["Timestamp", building_column]],
+        building_column=building_column,
     )
 
     timestamp_strings = history["Date"].dt.strftime("%Y-%m-%dT%H:%M:%S%z").copy()
     df = pd.DataFrame({
         "timestamp": history["Date"],
-        "value": history[BUILDING_COLUMN].astype(float),
+        "value": history[building_column].astype(float),
     })
     return df, timestamp_strings
 
 
 def main():
+    from config import BUILDINGS, BUILDING_COLUMN
+
     parser = argparse.ArgumentParser(
         description=(
             "Impute gaps in a 7-day (1008-point, 10-min interval) window of "
@@ -149,8 +169,19 @@ def main():
         help="Cassandra mode only: YYYY-MM-DD. The 7-day window ending the day before this date will be pulled from Cassandra.",
     )
     parser.add_argument(
+        "--building", choices=BUILDINGS, default=BUILDING_COLUMN,
+        help=(
+            "Cassandra mode: which building/column to reconstruct "
+            f"(default: {BUILDING_COLUMN}). Ignored in CSV mode."
+        ),
+    )
+    parser.add_argument(
         "--output", required=True,
         help="Output CSV path. Will contain columns 'timestamp', 'value' (imputed), 'quality' (0=real, 1=linear, 2=contextual, 3=donor-day).",
+    )
+    parser.add_argument(
+        "--plot",
+        help="Optional PNG path. If given, renders a reconstruction overlay plot alongside the output CSV.",
     )
     parser.add_argument(
         "--seed", type=int, default=None,
@@ -161,16 +192,26 @@ def main():
     if args.source == "csv":
         if not args.input:
             fail("--input is required when --source=csv")
+        if args.building != BUILDING_COLUMN:
+            print(
+                f"[NOTE] --building={args.building} is ignored in CSV mode "
+                f"(CSV uses a generic 'value' column)."
+            )
         df, timestamp_strings = load_input(args.input)
+        building_column = BUILDING_COLUMN
     else:
         if not args.target_date:
             fail("--target-date is required when --source=cassandra")
-        df, timestamp_strings = load_cassandra_window(args.target_date)
+        df, timestamp_strings = load_cassandra_window(args.target_date, args.building)
+        building_column = args.building
 
     n_gaps = int(df["value"].isna().sum())
 
     try:
-        imputed, quality = impute(df["value"], df["timestamp"], random_seed=args.seed)
+        imputed, quality = impute(
+            df["value"], df["timestamp"],
+            random_seed=args.seed, building_column=building_column,
+        )
     except Exception as exc:
         fail(f"impute() raised {type(exc).__name__}: {exc}")
 
@@ -189,6 +230,14 @@ def main():
         fail(f"could not write output CSV {args.output}: {exc}")
 
     print(f"[OK] Imputed {n_gaps} gap point(s) -> {args.output}")
+
+    if args.plot:
+        try:
+            from plot_reconstruction import render
+            render(args.output, args.plot, building_column)
+        except Exception as exc:
+            fail(f"plot_reconstruction.render() raised {type(exc).__name__}: {exc}")
+        print(f"[OK] Plot -> {args.plot}")
 
 
 if __name__ == "__main__":
