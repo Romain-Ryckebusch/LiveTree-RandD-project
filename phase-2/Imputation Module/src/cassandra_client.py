@@ -22,7 +22,6 @@ from config import (
 
 def _get_session():
     """Create and return a Cassandra session."""
-    # Auth is optional — the supervisors' single-node setup has no auth
     if CASSANDRA_USERNAME:
         auth = PlainTextAuthProvider(
             username=CASSANDRA_USERNAME,

@@ -212,7 +212,7 @@ class TemperatureAwareHybridEngine:
             df = self._merge_weather(df)
         self._fill_airtemp(df)
         precomp_bounds = self._precompute_all(df)
-        print("[BENCH] Precomputation done — starting runs.", flush=True)
+        print("[BENCH] Precomputation done, starting runs.", flush=True)
 
         rng = np.random.default_rng(random_state)
 
@@ -268,7 +268,7 @@ class TemperatureAwareHybridEngine:
         end_idx: int,
         bounds: Dict[str, Tuple[float, float]],
     ):
-        """Lightweight gap-fill used by benchmark() — skips full pipeline overhead.
+        """Lightweight gap-fill used by benchmark(), skips full pipeline overhead.
 
         Assumes templates, anomaly scores, and peer correlations are already
         populated on self (done once by benchmark before the run loop).
@@ -529,9 +529,10 @@ class TemperatureAwareHybridEngine:
 
     def _fill_long_gap(self, df: pd.DataFrame, site: str, start_idx: int, end_idx: int, gap_size: int):
         self._fill_ensemble(df, site, start_idx, end_idx, gap_size)
-        self._normalize_long_gap_amplitude(df, site, start_idx, end_idx)
+        norm_info = self._normalize_long_gap_amplitude(df, site, start_idx, end_idx)
         self._apply_adaptive_smoothing(df, site, start_idx, end_idx)
-        self._align_to_edge_levels(df, site, start_idx, end_idx)
+        align_info = self._align_to_edge_levels(df, site, start_idx, end_idx)
+        self._last_postproc = {'norm': norm_info, 'align': align_info}
 
     def _route_gap_7layer(self, df: pd.DataFrame, site: str, start_idx: int, end_idx: int, log_strategy: bool = True):
         """Explicit 7-layer pilotage router.
@@ -583,14 +584,19 @@ class TemperatureAwareHybridEngine:
             confidence *= 0.8
 
         if log_strategy:
-            self.strategy_log.append({
+            entry = {
                 'site': site,
                 'gap_start': int(start_idx),
                 'gap_end': int(end_idx),
                 'gap_size': int(gap_size),
                 'strategy': strategy,
                 'confidence': float(confidence),
-            })
+            }
+            pp = getattr(self, '_last_postproc', None)
+            if pp is not None:
+                entry['postproc'] = pp
+                self._last_postproc = None
+            self.strategy_log.append(entry)
 
     def _try_spline_fill(self, df: pd.DataFrame, site: str, start_idx: int, end_idx: int) -> bool:
         vals = self._method_spline(df, site, start_idx, end_idx)
@@ -954,42 +960,67 @@ class TemperatureAwareHybridEngine:
         ramp = np.linspace(start_offset, end_offset, gap_len)
         return blended + ramp
 
-    def _align_to_edge_levels(self, df: pd.DataFrame, site: str, start_idx: int, end_idx: int, lookback: int = 36):
-        """Nudge long-gap fill to match edge means AND trends (reduces level/slope bias on long outages)."""
+    def _align_to_edge_levels(self, df: pd.DataFrame, site: str, start_idx: int, end_idx: int, lookback: int = 36, divergence_context: int = 288):
+        """Nudge long-gap fill to match edge means and trends.
+
+        Caps the per-edge offset at half the donor's std so the linspace ramp
+        cannot shift the whole gap. When the wider context is divergent, the
+        slope-blend weight drops to 0, slopes from a flat side and a
+        high-cycle side are not comparable.
+
+        Returns a dict describing the decision for the strategy_log.
+        """
         filled = df.loc[start_idx:end_idx - 1, site].to_numpy(dtype=float)
         if len(filled) == 0 or np.isnan(filled).all():
-            return
+            return None
 
         before = df.loc[max(0, start_idx - lookback):start_idx - 1, site].dropna()
         after = df.loc[end_idx:min(len(df) - 1, end_idx + lookback), site].dropna()
         if len(before) == 0 or len(after) == 0:
-            return
+            return None
 
-        start_offset = float(before.mean() - filled[0])
-        end_offset = float(after.mean() - filled[-1])
-        
+        # Reuse the same wide window as _normalize_long_gap_amplitude so the
+        # two stages agree on what "divergent" means.
+        wb = df.loc[max(0, start_idx - divergence_context):start_idx - 1, site].dropna().to_numpy(dtype=float)
+        wa = df.loc[end_idx:min(len(df) - 1, end_idx + divergence_context), site].dropna().to_numpy(dtype=float)
+        if len(wb) > 0 and len(wa) > 0:
+            div = self._context_divergence(wb, wa)
+        else:
+            div = {'is_divergent': False}
+
+        raw_start = float(before.mean() - filled[0])
+        raw_end = float(after.mean() - filled[-1])
+
+        cap = 0.5 * float(np.std(filled))
+        if cap > 0:
+            start_offset = float(np.clip(raw_start, -cap, cap))
+            end_offset = float(np.clip(raw_end, -cap, cap))
+        else:
+            start_offset, end_offset = raw_start, raw_end
+
         if len(before) >= 4:
             before_times = np.arange(len(before))
             before_slope = np.polyfit(before_times[-4:], before.values[-4:], 1)[0]
         else:
             before_slope = 0.0
-            
+
         if len(after) >= 4:
             after_times = np.arange(len(after))
             after_slope = np.polyfit(after_times[:4], after.values[:4], 1)[0]
         else:
             after_slope = 0.0
-        
+
         gap_pos = np.linspace(0.0, 1.0, len(filled))
-        
+
         level_ramp = start_offset + (end_offset - start_offset) * gap_pos
-        
+
         filled_times = np.arange(len(filled))
         slope_ramp = before_slope + (after_slope - before_slope) * gap_pos
-        
+
         adjusted = filled + level_ramp
-        
-        if len(filled) > 1:
+
+        slope_weight = 0.0 if div.get('is_divergent') else 0.2
+        if len(filled) > 1 and slope_weight > 0:
             # NOTE: original code wrote `filled[0]` here, conflating the value
             # of the first filled point with the time index zero. With filled[0]
             # ~ 100k W, the correction blew up to ±10⁵ and made the engine
@@ -1000,38 +1031,80 @@ class TemperatureAwareHybridEngine:
                 * (filled_times - filled_times[0])
                 / (len(filled) - 1)
             )
-            adjusted = adjusted + 0.2 * quad_correction
-        
-        df.loc[start_idx:end_idx - 1, site] = adjusted
+            adjusted = adjusted + slope_weight * quad_correction
 
+        df.loc[start_idx:end_idx - 1, site] = adjusted
+        capped = (raw_start != start_offset) or (raw_end != end_offset)
+        return {
+            'mode': 'align_capped' if capped else 'align_normal',
+            'cap': float(cap),
+            'start_offset_raw': float(raw_start),
+            'start_offset_applied': float(start_offset),
+            'end_offset_raw': float(raw_end),
+            'end_offset_applied': float(end_offset),
+            'slope_weight': float(slope_weight),
+        }
+
+
+    def _context_divergence(self, before: np.ndarray, after: np.ndarray) -> dict:
+        # A divergent context means averaging the two sides erases the donor's
+        # natural cycle, see plan note about Easter (flat-low) vs working week.
+        if len(before) == 0 or len(after) == 0:
+            return {'mean_ratio': 1.0, 'std_ratio': 1.0, 'is_divergent': False}
+        eps = 1e-6
+        b_mean, a_mean = float(np.mean(before)), float(np.mean(after))
+        b_std, a_std = float(np.std(before)), float(np.std(after))
+        mean_ratio = max(b_mean, a_mean) / max(min(b_mean, a_mean), eps)
+        std_ratio = max(b_std, a_std) / max(min(b_std, a_std), eps)
+        is_divergent = (std_ratio > 3.0) or (mean_ratio > 1.4)
+        return {
+            'mean_ratio': float(mean_ratio),
+            'std_ratio': float(std_ratio),
+            'is_divergent': bool(is_divergent),
+        }
 
     def _normalize_long_gap_amplitude(self, df: pd.DataFrame, site: str, start_idx: int, end_idx: int, context: int = 288):
         """Affine-normalize long-gap fill to nearby observed mean/std.
 
-        This reduces over/under-shoot on 24h+ gaps before edge alignment.
+        Returns a dict describing the decision (mode, ratios, scale) for the
+        strategy_log.
         """
         filled = df.loc[start_idx:end_idx - 1, site].to_numpy(dtype=float)
         if len(filled) == 0 or np.isnan(filled).all():
-            return
+            return None
 
         before = df.loc[max(0, start_idx - context):start_idx - 1, site].dropna().to_numpy(dtype=float)
         after = df.loc[end_idx:min(len(df) - 1, end_idx + context), site].dropna().to_numpy(dtype=float)
         if len(before) == 0 or len(after) == 0:
-            return
+            return None
 
+        div = self._context_divergence(before, after)
+        # Keep the symmetric average even when the contexts diverge: the
+        # edge-alignment cap in _align_to_edge_levels is what bounds the
+        # over/under-shoot, not the picker. The divergence flag is still
+        # logged so the mode can be read back from the strategy log.
         target_mean = 0.5 * (float(np.mean(before)) + float(np.mean(after)))
         target_std = 0.5 * (float(np.std(before)) + float(np.std(after)))
+        mode = 'norm_divergent_symmetric' if div['is_divergent'] else 'norm_symmetric'
 
         cur_mean = float(np.mean(filled))
         cur_std = float(np.std(filled))
         if cur_std < 1e-6:
             adjusted = filled - cur_mean + target_mean
+            scale_applied = 1.0
         else:
             scale = target_std / cur_std if target_std > 1e-6 else 1.0
             scale = float(np.clip(scale, 0.6, 1.8))
             adjusted = (filled - cur_mean) * scale + target_mean
+            scale_applied = scale
 
         df.loc[start_idx:end_idx - 1, site] = adjusted
+        return {
+            'mode': mode,
+            'std_ratio': float(div['std_ratio']),
+            'mean_ratio': float(div['mean_ratio']),
+            'scale_applied': float(scale_applied),
+        }
 
     def _method_template_multi_scale(self, df: pd.DataFrame, site: str, start_idx: int, end_idx: int) -> np.ndarray:
         trend = self._extract_trend(df, site, start_idx, end_idx)
@@ -1052,7 +1125,7 @@ class TemperatureAwareHybridEngine:
         return np.linspace(bv, av, end_idx - start_idx)
 
     def _extract_seasonal(self, df: pd.DataFrame, site: str, start_idx: int, end_idx: int, period: int) -> np.ndarray:
-        """PERF #5: fully vectorised 2-D numpy gather — zero Python loop over gap positions.
+        """PERF #5: fully vectorised 2-D numpy gather, zero Python loop over gap positions.
 
         Builds a (gap_len, 8) index matrix of all lookback positions at once, gathers
         values in a single fancy-index op, then takes nanmedian along axis=1.
@@ -1098,7 +1171,7 @@ class TemperatureAwareHybridEngine:
         period_year = 144 * 365   # steps per year at 10-min resolution
 
         gap_positions = np.arange(start_idx, end_idx)                    # (gap_len,)
-        offsets = np.arange(1, 4) * period_year                          # (3,) — up to 3 years back
+        offsets = np.arange(1, 4) * period_year                          # (3,), up to 3 years back
         candidate_idx = gap_positions[:, None] - offsets[None, :]        # (gap_len, 3)
 
         valid_mask = (candidate_idx >= 0) & (candidate_idx < start_idx)
@@ -1232,7 +1305,7 @@ class TemperatureAwareHybridEngine:
         
         BUG #1: each row classified using its OWN timestamp (not iloc[0]).
         PERF #6: single groupby pass per site, sliced per regime/season/day_type.
-        PERF #8: vectorised regime + season + day_type assignment — no row-wise .apply().
+        PERF #8: vectorised regime + season + day_type assignment, no row-wise .apply().
         """
         self._templates = {}
 

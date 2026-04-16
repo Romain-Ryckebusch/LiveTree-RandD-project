@@ -69,7 +69,7 @@ def render(
         )
 
     ax.set_title(
-        f"Reconstruction — {building_column} — "
+        f"Reconstruction, {building_column}, "
         f"{window_start} -> {window_end}  "
         f"({n_imputed} imputed / {len(df)} pts)"
     )

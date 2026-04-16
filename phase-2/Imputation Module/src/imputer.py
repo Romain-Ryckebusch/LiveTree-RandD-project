@@ -34,6 +34,17 @@ def _to_window_time(ts: pd.Series) -> pd.Series:
 _ENGINE: Dict[str, TemperatureAwareHybridEngine] = {}
 _WEATHER: Optional[pd.DataFrame] = None
 _HISTORY_CACHE: Dict[str, pd.DataFrame] = {}
+_LAST_STRATEGY_LOG: list = []
+_LAST_EXTENSION_LEN: int = 0
+
+
+def get_last_strategy_log() -> list:
+    """Return strategy_log (with postproc decisions) from the most recent impute() call.
+
+    Indices in the entries are offset to align with the caller's input series
+    (history extension already subtracted), and out-of-window gaps are dropped.
+    """
+    return list(_LAST_STRATEGY_LOG)
 
 
 def set_history_source(df: Optional[pd.DataFrame], building_column: str) -> None:
@@ -252,6 +263,7 @@ def impute(
         )
 
     flags = np.zeros(len(s), dtype=int)
+    aligned_log = []
     for entry in strategy_log:
         gs_ext = int(entry["gap_start"])
         ge_ext = int(entry["gap_end"])
@@ -263,9 +275,14 @@ def impute(
             # gap fell entirely within the prepended history
             continue
         flags[gs:ge] = _flag_for_strategy(str(entry["strategy"]))
+        aligned_log.append({**entry, "gap_start": gs, "gap_end": ge})
     unlogged = initial_na & (flags == 0)
     flags[unlogged] = 2
     flags[~initial_na] = 0
+
+    global _LAST_STRATEGY_LOG, _LAST_EXTENSION_LEN
+    _LAST_STRATEGY_LOG = aligned_log
+    _LAST_EXTENSION_LEN = extension_len
 
     original_index = (
         series.index if isinstance(series, pd.Series) else pd.RangeIndex(len(s))

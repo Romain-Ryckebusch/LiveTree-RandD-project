@@ -49,10 +49,10 @@ def apply_test_gaps(df, gaps, value_col="value", source="csv"):
 
     Returns (df_masked, ground_truth, mask):
         df_masked: copy of df with value_col NaN'd on masked rows.
-        ground_truth: np.ndarray[float] aligned to df.index — NaN outside the
+        ground_truth: np.ndarray[float] aligned to df.index, NaN outside the
             mask, original values inside (incl. NaN if the source was already
             NaN).
-        mask: np.ndarray[bool] — True where any gap covers the row.
+        mask: np.ndarray[bool], True where any gap covers the row.
 
     Handles naive (CSV) vs tz-aware (Cassandra, UTC) timestamps by detecting
     df[timestamp].dt.tz and localizing user bounds with config.TIMEZONE
@@ -127,6 +127,53 @@ def apply_test_gaps(df, gaps, value_col="value", source="csv"):
     return df, ground_truth, mask
 
 
+def _strategy_lines_for_mask(mask):
+    """Return '# strategy=...' / '# postproc.* ...' lines for gaps overlapping the mask.
+
+    Reads the strategy_log populated by the most recent imputer.impute() call;
+    indices in that log are already aligned to the input series.
+    """
+    lines = []
+    try:
+        log = imputer.get_last_strategy_log()
+    except Exception:
+        return lines
+    n = len(mask)
+    for entry in log:
+        gs = max(0, int(entry.get("gap_start", 0)))
+        ge = min(n, int(entry.get("gap_end", 0)))
+        if ge <= gs:
+            continue
+        if not bool(mask[gs:ge].any()):
+            continue
+        lines.append(
+            f"# strategy={entry.get('strategy', '?')} "
+            f"confidence={float(entry.get('confidence', 0.0)):.2f} "
+            f"gap_size={int(entry.get('gap_size', ge - gs))}"
+        )
+        pp = entry.get("postproc") or {}
+        n_info = pp.get("norm") or {}
+        a_info = pp.get("align") or {}
+        if n_info:
+            lines.append(
+                f"# postproc.norm mode={n_info.get('mode', '?')} "
+                f"std_ratio={float(n_info.get('std_ratio', 0.0)):.2f} "
+                f"mean_ratio={float(n_info.get('mean_ratio', 0.0)):.2f} "
+                f"scale={float(n_info.get('scale_applied', 0.0)):.3f}"
+            )
+        if a_info:
+            lines.append(
+                f"# postproc.align mode={a_info.get('mode', '?')} "
+                f"cap={float(a_info.get('cap', 0.0)):.0f} "
+                f"start_offset_raw={float(a_info.get('start_offset_raw', 0.0)):.0f} "
+                f"applied={float(a_info.get('start_offset_applied', 0.0)):.0f} "
+                f"end_offset_raw={float(a_info.get('end_offset_raw', 0.0)):.0f} "
+                f"applied={float(a_info.get('end_offset_applied', 0.0)):.0f} "
+                f"slope_weight={float(a_info.get('slope_weight', 0.0)):.2f}"
+            )
+    return lines
+
+
 def write_test_report(
     path, timestamp_strings, ground_truth, imputed, quality, mask,
 ):
@@ -135,7 +182,9 @@ def write_test_report(
     Report schema: timestamp, ground_truth, imputed, quality, abs_error.
     Metrics (MAE, RMSE, max_err) are computed over masked rows where
     ground_truth is not NaN, written as '# key=value' footer comments, and
-    echoed on stdout.
+    echoed on stdout. When a long-gap path was taken, the post-processing
+    decision (divergence detection, amplitude scale, edge-offset cap) is
+    written as '# strategy=' and '# postproc.*' header comments.
     """
     masked_idx = np.flatnonzero(mask)
     gt = ground_truth[masked_idx]
@@ -159,8 +208,12 @@ def write_test_report(
     else:
         mae = rmse = max_err = float("nan")
 
+    header_lines = _strategy_lines_for_mask(mask)
+
     try:
         with open(path, "w", newline="\n") as fh:
+            for line in header_lines:
+                fh.write(line + "\n")
             report_df.to_csv(fh, index=False, line_terminator="\n")
             fh.write(f"# MAE={mae:.4f}\n")
             fh.write(f"# RMSE={rmse:.4f}\n")
