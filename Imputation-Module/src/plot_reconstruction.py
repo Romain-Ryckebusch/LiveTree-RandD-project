@@ -108,6 +108,10 @@ def render(
         from matplotlib.patches import Patch
         handles.append(Patch(facecolor="0.85", alpha=0.4,
                              label="Test-mode masked range"))
+    # Headroom above the data so the upper-right legend box doesn't sit on
+    # top of the reconstructed curve.
+    ymin, ymax = ax.get_ylim()
+    ax.set_ylim(ymin, ymax + (ymax - ymin) * 0.18)
     ax.legend(handles=handles, loc="upper right", fontsize=9)
 
     fig.autofmt_xdate()
