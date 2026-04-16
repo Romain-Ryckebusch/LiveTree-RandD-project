@@ -1,8 +1,5 @@
 # Data files
-*.csv
 *.parquet
-*.xlsx
-*.xls
 *.xml
 
 # Machine learning models & scalers (ignored by default)
@@ -54,8 +51,8 @@ ca-cert
 *.log
 
 # docker-imputation runtime dirs
-phase-2/Imputation Module/docker-imputation/io/
-phase-2/Imputation Module/docker-imputation/cache/
+phase-2/Imputation-Module/docker-imputation/io/
+phase-2/Imputation-Module/docker-imputation/cache/
 
 # Office documents
 *.docx

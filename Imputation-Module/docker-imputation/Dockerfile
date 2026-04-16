@@ -6,10 +6,10 @@ RUN apt-get update && \
 
 WORKDIR /app/pkg
 
-COPY ["phase-2/Imputation Module/docker-imputation/requirements.txt", "./"]
+COPY ["phase-2/Imputation-Module/docker-imputation/requirements.txt", "./"]
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY ["phase-2/Imputation Module/src/", "/app/pkg/"]
+COPY ["phase-2/Imputation-Module/src/", "/app/pkg/"]
 
 RUN mkdir -p /app/cache /io /data
 

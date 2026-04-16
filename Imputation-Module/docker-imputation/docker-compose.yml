@@ -2,7 +2,7 @@ services:
   imputer:
     build:
       context: ../../..
-      dockerfile: "phase-2/Imputation Module/docker-imputation/Dockerfile"
+      dockerfile: "phase-2/Imputation-Module/docker-imputation/Dockerfile"
     image: rd-imputer:latest
     container_name: rd_imputer
     volumes:
