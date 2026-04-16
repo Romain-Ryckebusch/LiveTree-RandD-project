@@ -1,15 +1,10 @@
-"""PNG reconstruction overlay for the imputer's output CSV.
-
-Reads the CSV produced by impute_cli (columns: timestamp, value, quality)
-and renders a 7-day overlay showing real measurements vs. imputed values,
-color-coded by the quality flag.
-"""
+"""Renders the reconstruction overlay PNG from impute_cli's output CSV."""
 from __future__ import annotations
 
 import os
 
 import matplotlib
-matplotlib.use("Agg")  # headless
+matplotlib.use("Agg")  # no display in the container
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -108,8 +103,8 @@ def render(
         from matplotlib.patches import Patch
         handles.append(Patch(facecolor="0.85", alpha=0.4,
                              label="Test-mode masked range"))
-    # Headroom above the data so the upper-right legend box doesn't sit on
-    # top of the reconstructed curve.
+
+    # Push the ymax up so the upper-right legend doesn't sit on top of the curve.
     ymin, ymax = ax.get_ylim()
     ax.set_ylim(ymin, ymax + (ymax - ymin) * 0.18)
     ax.legend(handles=handles, loc="upper right", fontsize=9)

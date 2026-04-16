@@ -1,34 +1,32 @@
 #!/usr/bin/env bash
-# Reconstruct the 4 buildings + the campus total for a given target date,
-# writing one CSV + one PNG per building into ./io/.
+# Reconstruct all four buildings plus the campus total for a given date.
+# Writes one CSV + one PNG per target into ./io/.
 #
 # Usage:
 #   CASSANDRA_HOSTS=10.64.253.14 ./run-all-buildings.sh [TARGET_DATE] \
-#     [--test-gap START END]... [--overlay-prior-week] [--overlay-actual] \
-#     [--no-clear]
+#       [--test-gap START END]... [--overlay-prior-week] [--overlay-actual] \
+#       [--no-clear]
 #
 # TARGET_DATE defaults to today (UTC). The 7-day window ending the day
 # before TARGET_DATE is what actually gets reconstructed.
 #
-# --test-gap is repeatable. When at least one is given, each building's
-# run also emits a test_report CSV (MAE/RMSE/max) and output filenames
-# are suffixed with _test so clean reconstructions are not overwritten.
-# START/END are naive Europe/Paris datetimes, e.g. '2026-04-14 08:00'.
+# --test-gap can be passed multiple times. When at least one is given, each
+# building's run also emits a test_report CSV (MAE/RMSE/max) and the output
+# filenames are suffixed with _test so clean reconstructions aren't
+# overwritten. START/END are naive Europe/Paris datetimes.
 #
-# --overlay-prior-week adds a dashed purple curve to each PNG showing the
-# 7 days preceding the reconstructed window (shifted +7 days), i.e. a naive
-# "copy last week" baseline for visually comparing against our algorithm.
+# --overlay-prior-week adds a dashed purple curve showing the 7 days before
+# the reconstructed window, shifted +7 days. It's the "just copy last week"
+# baseline, useful for a visual sanity check.
 #
-# --overlay-actual adds a solid black curve showing the actual (pre-imputation)
-# measured values. In --test-gap mode this reveals the ground truth under the
-# synthetic gaps; in normal mode it is the raw input with real sensor gaps
-# left as breaks in the line.
+# --overlay-actual adds a solid black curve with the actual pre-imputation
+# values. In --test-gap mode that's the ground truth; otherwise it's just
+# the raw input with sensor gaps showing as breaks.
 #
-# By default, this script clears prior reconstruction outputs (reconstructed*.csv,
-# reconstructed*.png, test_report_*.csv) from ./io/ before running, so the folder
-# only holds artifacts from the latest run. Pass --no-clear to preserve them,
-# e.g. when comparing a new run against a previous one. input*.csv and files
-# from other workflows are never touched.
+# By default we wipe reconstructed*.csv/png and test_report_*.csv in ./io/
+# before running, so the folder only holds the latest run. Pass --no-clear
+# to keep old outputs around (handy for diffing). input*.csv and anything
+# from other workflows is left alone.
 
 set -euo pipefail
 

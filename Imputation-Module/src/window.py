@@ -1,10 +1,3 @@
-"""7-day window extraction for the imputer.
-
-Data-source agnostic: the caller passes DataFrames loaded from either CSV
-or Cassandra. The function reindexes history onto a complete 10-minute
-grid so that sparse Cassandra rows (missing timestamps have no row at
-all) become NaN values the imputer can detect, just like CSV data.
-"""
 import numpy as np
 import pandas as pd
 import pytz
@@ -18,22 +11,8 @@ from config import (
 
 
 def extract_window(df, target_date, weather_df, building_column=None):
-    """
-    Extract the 7-day history window and target-day weather for a given date.
-
-    Parameters
-    ----------
-    building_column : str, optional
-        Consumption column to slice for the actual-target readback. Defaults
-        to config.BUILDING_COLUMN when not provided.
-
-    Returns
-    -------
-    history_df : DataFrame (1008 rows, NaN where measurements were missing)
-    target_timestamps : list of datetime (144, local time for feature engineering)
-    weather_temps : array (144)
-    actual_target : array (144) or None
-    """
+    """Pull the 7-day window ending the day before target_date, plus weather
+    for target_date itself. Works on both CSV frames and Cassandra pulls."""
     target_column = building_column or BUILDING_COLUMN
     tz = pytz.timezone(TIMEZONE)
 
@@ -51,11 +30,11 @@ def extract_window(df, target_date, weather_df, building_column=None):
     else:
         df["Date"] = df["Date"].dt.tz_convert("UTC")
 
-    mask_hist = (df["Date"] >= history_start_utc) & (df["Date"] < target_start_utc)
-    history = df.loc[mask_hist].copy()
+    hist_mask = (df["Date"] >= history_start_utc) & (df["Date"] < target_start_utc)
+    history = df.loc[hist_mask].copy()
 
-    # Reindex against a full 10-min grid so any missing timestamps become NaN
-    # rows the imputer can detect.
+    # Cassandra rows are sparse (missing timestamps have no row at all); reindex
+    # onto a full 10-min grid so the imputer can actually see the NaNs.
     full_grid = pd.date_range(
         history_start_utc, periods=LOOKBACK_POINTS, freq="10min", tz="UTC"
     )
@@ -81,10 +60,10 @@ def extract_window(df, target_date, weather_df, building_column=None):
     else:
         weather_df["Date"] = weather_df["Date"].dt.tz_convert("UTC")
 
-    mask_weather = (weather_df["Date"] >= target_start_utc) & (
+    weather_mask = (weather_df["Date"] >= target_start_utc) & (
         weather_df["Date"] <= target_end_utc
     )
-    weather_slice = weather_df.loc[mask_weather]
+    weather_slice = weather_df.loc[weather_mask]
 
     if len(weather_slice) >= POINTS_PER_DAY:
         weather_temps = weather_slice["AirTemp"].values[:POINTS_PER_DAY]
@@ -93,8 +72,8 @@ def extract_window(df, target_date, weather_df, building_column=None):
         if len(weather_slice) > 0:
             weather_temps[: len(weather_slice)] = weather_slice["AirTemp"].values
 
-    mask_actual = (df["Date"] >= target_start_utc) & (df["Date"] <= target_end_utc)
-    actual_slice = df.loc[mask_actual]
+    actual_mask = (df["Date"] >= target_start_utc) & (df["Date"] <= target_end_utc)
+    actual_slice = df.loc[actual_mask]
     actual_target = None
     if len(actual_slice) >= POINTS_PER_DAY:
         actual_target = actual_slice[target_column].values[:POINTS_PER_DAY]

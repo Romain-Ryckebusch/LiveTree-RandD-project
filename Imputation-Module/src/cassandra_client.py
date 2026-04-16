@@ -1,9 +1,3 @@
-"""
-Cassandra data source for the demo pipeline.
-
-Reads consumption and weather data from the Cassandra tables
-and returns DataFrames in the same format as the CSV loaders.
-"""
 import pandas as pd
 from cassandra.cluster import Cluster
 from cassandra.auth import PlainTextAuthProvider
@@ -21,7 +15,6 @@ from config import (
 
 
 def _get_session():
-    """Create and return a Cassandra session."""
     if CASSANDRA_USERNAME:
         auth = PlainTextAuthProvider(
             username=CASSANDRA_USERNAME,
@@ -42,12 +35,8 @@ def _get_session():
 
 
 def load_historical_data_cassandra():
-    """
-    Load consumption data from Cassandra.
-
-    Returns a DataFrame with columns matching the CSV format:
-    Date, Ptot_HA, Ptot_HEI_13RT, Ptot_HEI_5RNS, Ptot_RIZOMM, ...
-    """
+    """Pull the full consumption table. Returns a DataFrame with Date plus
+    one column per building (Ptot_HA, Ptot_HEI_13RT, Ptot_HEI_5RNS, Ptot_RIZOMM)."""
     session, cluster = _get_session()
     try:
         query = f'SELECT * FROM {CONSO_TABLE} WHERE name=%s'
@@ -61,7 +50,6 @@ def load_historical_data_cassandra():
 
         df = df.sort_values("Date").reset_index(drop=True)
 
-        # Drop columns the demo pipeline doesn't use
         for col in ("name", "Quality"):
             if col in df.columns:
                 df = df.drop(columns=[col])
@@ -76,11 +64,7 @@ def load_historical_data_cassandra():
 
 
 def load_weather_data_cassandra():
-    """
-    Load weather data from Cassandra.
-
-    Returns a DataFrame with columns: Date, AirTemp, ...
-    """
+    """Pull the weather table. Returns a DataFrame with Date and AirTemp."""
     session, cluster = _get_session()
     try:
         query = f'SELECT * FROM {METEO_TABLE} WHERE name=%s'

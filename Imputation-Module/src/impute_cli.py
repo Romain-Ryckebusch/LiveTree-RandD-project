@@ -1,10 +1,8 @@
-"""CLI wrapper around imputer.impute for the dockerized imputation service.
+"""CLI entry point for the dockerized imputer.
 
-Reads a 7-day window of holed consumption data from a CSV (--source csv) or
-pulls it from Cassandra (--source cassandra), runs the
-TemperatureAwareHybridEngine via imputer.impute, and writes the imputed
-series plus per-point quality flags to a CSV. --building picks the Cassandra
-column to reconstruct; Ptot_Campus is the sum of the four buildings.
+Reads a 7-day holed window from either a CSV (--source csv) or Cassandra
+(--source cassandra), runs it through TemperatureAwareHybridEngine, and
+writes the filled series plus per-point quality flags back to a CSV.
 """
 import argparse
 import sys
@@ -26,12 +24,6 @@ def fail(msg):
 
 
 def parse_test_gap(raw_start, raw_end):
-    """Parse one --test-gap pair as pandas Timestamps.
-
-    Bounds are treated as naive Europe/Paris local time if no tz is supplied.
-    Actual tz alignment against the DataFrame's timestamp column happens in
-    apply_test_gaps. Hard-fails on unparseable input or start > end.
-    """
     try:
         start = pd.Timestamp(raw_start)
         end = pd.Timestamp(raw_end)
@@ -45,19 +37,9 @@ def parse_test_gap(raw_start, raw_end):
 
 
 def apply_test_gaps(df, gaps, value_col="value", source="csv"):
-    """Mask df[value_col] where timestamp falls in any [start, end] (inclusive).
-
-    Returns (df_masked, ground_truth, mask):
-        df_masked: copy of df with value_col NaN'd on masked rows.
-        ground_truth: np.ndarray[float] aligned to df.index, NaN outside the
-            mask, original values inside (incl. NaN if the source was already
-            NaN).
-        mask: np.ndarray[bool], True where any gap covers the row.
-
-    Handles naive (CSV) vs tz-aware (Cassandra, UTC) timestamps by detecting
-    df[timestamp].dt.tz and localizing user bounds with config.TIMEZONE
-    (Europe/Paris) before converting when needed.
-    """
+    """Nuke df[value_col] where timestamp falls in any of `gaps`, in-memory only.
+    Returns (df_masked, ground_truth, mask). Handles naive (CSV) vs tz-aware
+    (Cassandra, UTC) timestamps transparently."""
     from config import TIMEZONE
 
     df = df.copy()
@@ -128,11 +110,8 @@ def apply_test_gaps(df, gaps, value_col="value", source="csv"):
 
 
 def _strategy_lines_for_mask(mask):
-    """Return '# strategy=...' / '# postproc.* ...' lines for gaps overlapping the mask.
-
-    Reads the strategy_log populated by the most recent imputer.impute() call;
-    indices in that log are already aligned to the input series.
-    """
+    """'# strategy=...' / '# postproc.* ...' comments for any gaps that
+    overlap `mask`, read from the last impute() call's strategy_log."""
     lines = []
     try:
         log = imputer.get_last_strategy_log()
@@ -177,15 +156,6 @@ def _strategy_lines_for_mask(mask):
 def write_test_report(
     path, timestamp_strings, ground_truth, imputed, quality, mask,
 ):
-    """Write per-masked-point report CSV and print summary metrics.
-
-    Report schema: timestamp, ground_truth, imputed, quality, abs_error.
-    Metrics (MAE, RMSE, max_err) are computed over masked rows where
-    ground_truth is not NaN, written as '# key=value' footer comments, and
-    echoed on stdout. When a long-gap path was taken, the post-processing
-    decision (divergence detection, amplitude scale, edge-offset cap) is
-    written as '# strategy=' and '# postproc.*' header comments.
-    """
     masked_idx = np.flatnonzero(mask)
     gt = ground_truth[masked_idx]
     im = imputed[masked_idx]
@@ -250,7 +220,7 @@ def load_input(path):
             f"(7 days x 144 points/day), got {len(df)}"
         )
 
-    # Keep input timestamp strings for the output (don't reformat via pandas).
+    # Keep the input strings verbatim for the output (don't round-trip through pandas).
     timestamp_strings = df["timestamp"].astype(str).copy()
 
     try:
@@ -278,16 +248,9 @@ def load_input(path):
 
 
 def load_cassandra_window(target_date, building_column, include_prior_week=False):
-    """Pull history + weather from Cassandra and extract the 7-day window.
-
-    Returns ``(df, timestamp_strings, prior_week_values)`` where
-    ``prior_week_values`` is a length-1008 ndarray of the 7 days preceding the
-    reconstructed window (in source order, NaN where missing) when
-    ``include_prior_week`` is True, else ``None``. The function also seeds
-    imputer's history cache for ``building_column``. For Ptot_Campus the
-    column is built as the sum of the four buildings with skipna=False, so a
-    single missing component leaves the row missing.
-    """
+    """Pull the 7-day window for `target_date` out of Cassandra, plus weather,
+    plus optionally the prior-week window for the --overlay-prior-week plot.
+    Also seeds imputer's history cache."""
     try:
         from cassandra_client import (
             load_historical_data_cassandra,
@@ -316,6 +279,7 @@ def load_cassandra_window(target_date, building_column, include_prior_week=False
                 f"Cassandra is missing Campus component columns: {missing_components}"
             )
         hist_df = hist_df.copy()
+        # skipna=False: one missing component means the Campus row is missing too.
         hist_df["Ptot_Campus"] = hist_df[CAMPUS_COMPONENTS].sum(axis=1, skipna=False)
     elif building_column not in hist_df.columns:
         fail(
@@ -340,7 +304,6 @@ def load_cassandra_window(target_date, building_column, include_prior_week=False
             f"Cassandra window for {target_date} has no {building_column} values at all"
         )
 
-    # Seed the engine's 56-day history from the Cassandra pull.
     imputer.set_history_source(
         hist_df.rename(columns={"Date": "Timestamp"})[["Timestamp", building_column]],
         building_column=building_column,

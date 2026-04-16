@@ -1,8 +1,4 @@
-"""Adapter wrapping TemperatureAwareHybridEngine for the pilotage module.
-
-Caller passes ``building_column`` through set_history_source and impute;
-engine and history caches are keyed by that column name.
-"""
+"""Thin wrapper around TemperatureAwareHybridEngine for single-series use."""
 import contextlib
 import io
 import os
@@ -25,7 +21,7 @@ from hybrid_engine import TemperatureAwareHybridEngine
 
 
 def _to_window_time(ts: pd.Series) -> pd.Series:
-    # Match window.extract_window's tz handling (UTC -> Paris -> naive).
+    # Same tz handling as window.extract_window: UTC -> Paris -> naive.
     if ts.dt.tz is None:
         return ts.dt.tz_localize("UTC").dt.tz_convert(TIMEZONE).dt.tz_localize(None)
     return ts.dt.tz_convert(TIMEZONE).dt.tz_localize(None)
@@ -39,19 +35,13 @@ _LAST_EXTENSION_LEN: int = 0
 
 
 def get_last_strategy_log() -> list:
-    """Return strategy_log (with postproc decisions) from the most recent impute() call.
-
-    Indices in the entries are offset to align with the caller's input series
-    (history extension already subtracted), and out-of-window gaps are dropped.
-    """
+    """strategy_log from the most recent impute() call, with indices already
+    shifted back to the caller's series."""
     return list(_LAST_STRATEGY_LOG)
 
 
 def set_history_source(df: Optional[pd.DataFrame], building_column: str) -> None:
-    """Inject a pre-loaded history for ``building_column`` instead of reading CSVs.
-
-    Used by the Cassandra CLI path. Pass None or an empty frame to reset.
-    """
+    """Let the Cassandra CLI path inject a pre-loaded history. Pass None to reset."""
     if df is None or df.empty:
         _HISTORY_CACHE[building_column] = pd.DataFrame(
             columns=["Timestamp", building_column]
@@ -66,14 +56,16 @@ def set_history_source(df: Optional[pd.DataFrame], building_column: str) -> None
             .reset_index(drop=True)
         )
         _HISTORY_CACHE[building_column] = cleaned
-    # Drop cached engine so the new history is picked up.
+    # Force engine rebuild so the new history gets picked up.
     _ENGINE.pop(building_column, None)
 
-# 8 weeks: minimum context the long-gap ensemble needs before its >40% fallback kicks in.
+
+# 8 weeks: the long-gap ensemble needs this much context before its
+# >40%-missing fallback stops kicking in.
 _PREPEND_DAYS = 56
 
-# Strategy codes emitted by TemperatureAwareHybridEngine (hybrid_engine.py).
-# Quality flags: 1=linear, 2=contextual, 3=donor-day.
+# Maps TemperatureAwareHybridEngine strategy codes to CLI quality flags.
+# 1 = linear, 2 = contextual, 3 = donor-day.
 _STRATEGY_FLAG_MAP = {
     "LINEAR_MICRO": 1,
     "LINEAR_SHORT": 1,
@@ -98,7 +90,7 @@ def _load_combined_history(building_column: str) -> pd.DataFrame:
     if cached is not None:
         return cached
 
-    # CSV fallback only has Ptot_HA. Other buildings must be seeded from Cassandra.
+    # Only Ptot_HA has CSVs; the other buildings need the Cassandra history seed.
     if building_column != "Ptot_HA":
         empty = pd.DataFrame(columns=["Timestamp", building_column])
         _HISTORY_CACHE[building_column] = empty
@@ -146,12 +138,11 @@ def _extend_with_history(df_in: pd.DataFrame, building_column: str) -> pd.DataFr
         return df_in
 
     extended = pd.concat([extension, df_in], ignore_index=True, sort=False)
-    extended = (
+    return (
         extended.drop_duplicates(subset=["Timestamp"], keep="last")
         .sort_values("Timestamp")
         .reset_index(drop=True)
     )
-    return extended
 
 
 def _auto_low_variance_threshold(hist: pd.DataFrame, building_column: str) -> float:
@@ -177,7 +168,7 @@ def _get_engine(building_column: str) -> TemperatureAwareHybridEngine:
         engine = TemperatureAwareHybridEngine(
             site_cols=[building_column],
             weather_df=None,
-            use_historical_data=False,  # skip the missing 2021-2025 path
+            use_historical_data=False,  # the 2021-2025 path doesn't exist here
             template_cache_file=cache_path,
             low_variance_threshold=low_var,
         )
@@ -212,7 +203,7 @@ def impute(
     building_column: Optional[str] = None,
     **_kwargs,
 ):
-    """Single-series entry point routed through TemperatureAwareHybridEngine."""
+    """Impute a single series. Routes through TemperatureAwareHybridEngine."""
     bcol = building_column or BUILDING_COLUMN
     s = pd.Series(series).reset_index(drop=True)
     if isinstance(date_index, pd.DatetimeIndex):
@@ -233,8 +224,8 @@ def impute(
 
     df_in = _extend_with_history(df_window, bcol)
     window_start_ts = pd.Timestamp(dt_naive.iloc[0])
-    # Engine reindexes to a 10-min grid floored on min(Timestamp).
-    # Use the floored start for strategy-log offset alignment.
+    # Engine reindexes to a 10-min grid floored on min(Timestamp), so the
+    # strategy-log offset has to use the floored value too.
     extension_start_ts = df_in["Timestamp"].min().floor("10min")
     extension_len = int(
         (window_start_ts - extension_start_ts) / pd.Timedelta(minutes=10)
@@ -274,10 +265,11 @@ def impute(
         gs = min(gs, len(flags))
         ge = min(ge, len(flags))
         if ge <= gs:
-            # gap fell entirely within the prepended history
+            # gap fell entirely inside the prepended history
             continue
         flags[gs:ge] = _flag_for_strategy(str(entry["strategy"]))
         aligned_log.append({**entry, "gap_start": gs, "gap_end": ge})
+
     unlogged = initial_na & (flags == 0)
     flags[unlogged] = 2
     flags[~initial_na] = 0
@@ -299,8 +291,6 @@ def impute(
 def naive_impute(series: pd.Series, method: str = "linear"):
     """Zero-fill baseline used as a comparison point."""
     is_na = series.isna()
-    imputed = series.copy()
-    imputed = imputed.fillna(0.0)
-
+    imputed = series.copy().fillna(0.0)
     quality = pd.Series(np.where(is_na, 1, 0), index=series.index, dtype=int)
     return imputed, quality

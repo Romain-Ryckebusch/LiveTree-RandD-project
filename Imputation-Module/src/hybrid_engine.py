@@ -1,18 +1,8 @@
-"""
-TemperatureAwareHybridEngine, deployment gap recovery algorithm.
+"""Deployment gap-recovery engine used by imputer.py.
 
-This module replaces the previous hybrid engine with the extended
-deployment-gap-recovery algorithm (formerly ExtendedDeploymentAlgorithm at
-the repo root). The class name `TemperatureAwareHybridEngine` and its
-constructor / attribute surface are preserved so `imputer.py`,
-`impute_cli.py`, and the Docker stack continue to work unchanged.
-
-Key features:
-  - Multi-week (28-day) adaptive templates with recency bias
-  - Smart chunked recovery for long gaps (7+ days)
-  - Occupancy + calendar + weather external features
-  - Uncertainty bounds and low-confidence flagging
-  - Peer-correlation fill for sub-meters via meter hierarchy
+TemperatureAwareHybridEngine runs multi-week adaptive templates, smart
+chunked recovery, occupancy/calendar features, uncertainty bounds, and
+peer-correlation fallback for sub-meters.
 """
 
 import hashlib
@@ -68,9 +58,8 @@ METER_HIERARCHY = {
 
 
 def _load_all_holidays():
-    """Load holidays / close days / special days from any per-year CSVs that
-    happen to be present, falling back to a hardcoded 2026 list when the
-    files are missing (current production state)."""
+    """Load France holidays/close/special days from Consumption_<year>_<type>.csv
+    files if any are present, otherwise fall back to a hardcoded 2026 list."""
     holidays: set = set()
     close_days: set = set()
     special_days: set = set()
@@ -102,15 +91,8 @@ FRANCE_HOLIDAYS_2026, FRANCE_CLOSE_DAYS_2026, FRANCE_SPECIAL_DAYS_2026 = _load_a
 
 
 class TemperatureAwareHybridEngine:
-    """Deployment gap-recovery engine with multi-week templates, smart
-    chunking, occupancy awareness and uncertainty bounds.
-
-    The class name and the five legacy kwargs (`site_cols`, `weather_df`,
-    `use_historical_data`, `template_cache_file`, `low_variance_threshold`)
-    are preserved for compatibility with `imputer.py`. The ML stub flags
-    (`use_mice`, `use_knn`, `use_kalman`, `use_deep_learning`) default to
-    `False`: the underlying methods in this script are placeholders.
-    """
+    """Gap-recovery engine with multi-week templates, chunked recovery for
+    long gaps, peer correlation for sub-meters, and uncertainty bounds."""
 
     def __init__(
         self,
@@ -173,20 +155,13 @@ class TemperatureAwareHybridEngine:
         self._external_event_flags: Dict[str, List[str]] = {}
         self._weather_variance: Dict[str, float] = {}
 
-    # ─────────────────────────────────────────────────────────────────
-    # Main entry point
-    # ─────────────────────────────────────────────────────────────────
-
     def impute(self, df: pd.DataFrame, weather_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
-        """Impute gaps with multi-week templates, smart chunking, and
-        occupancy-aware features. Output preserves the input's
-        `Timestamp` + site columns (+ optional `AirTemp`).
-        """
+        """Main entry. Runs the full pipeline and returns a DataFrame with
+        Timestamp + the site columns (+ AirTemp if it's around)."""
         self.strategy_log = []
 
         df = df.copy().sort_values('Timestamp').reset_index(drop=True)
 
-        # Prepend injected historical data (imputer.py sets self.historical_df)
         if (
             self.use_historical_data
             and self.historical_df is not None
@@ -259,24 +234,19 @@ class TemperatureAwareHybridEngine:
         out_cols = ['Timestamp'] + self.site_cols + (['AirTemp'] if 'AirTemp' in df.columns else [])
         return df[[c for c in out_cols if c in df.columns]]
 
-    # ─────────────────────────────────────────────────────────────────
-    # Chunked gap recovery
-    # ─────────────────────────────────────────────────────────────────
-
     def _fill_chunked_gap(self, df: pd.DataFrame, site: str, gap_start: int, gap_end: int):
-        """Split long gaps into chunks, smart-chunking when enabled."""
         gap_size = gap_end - gap_start
 
         if self.use_smart_chunking:
             try:
                 chunks = self._get_smart_chunks(df, gap_start, gap_end)
             except Exception as e:
-                log.debug(f"[DEBUG] Smart chunking failed: {e}; falling back to fixed-size chunks")
+                log.debug(f"smart chunking failed: {e}; falling back to fixed-size")
                 chunks = self._fixed_size_chunks(gap_start, gap_end)
-            log.info(f"[CHUNKED-SMART] Splitting {gap_size} points ({site}) into {len(chunks)} smart chunks")
+            log.info(f"smart-chunked {gap_size} pts ({site}) -> {len(chunks)} chunks")
         else:
             chunks = self._fixed_size_chunks(gap_start, gap_end)
-            log.info(f"[CHUNKED] Splitting {gap_size} points ({site}) into {len(chunks)} chunks")
+            log.info(f"chunked {gap_size} pts ({site}) -> {len(chunks)} chunks")
 
         for chunk_idx, (chunk_start, chunk_end) in enumerate(chunks):
             chunk_size = chunk_end - chunk_start
@@ -286,7 +256,7 @@ class TemperatureAwareHybridEngine:
             else:
                 self._intelligent_router(df, site, chunk_start, chunk_end)
 
-            log.debug(f"[CHUNKED] Filled chunk {chunk_idx+1}/{len(chunks)}: "
+            log.debug(f"filled chunk {chunk_idx+1}/{len(chunks)}: "
                       f"indices {chunk_start}-{chunk_end}, size {chunk_size}")
 
     def _fixed_size_chunks(self, gap_start: int, gap_end: int) -> List[Tuple[int, int]]:
@@ -299,8 +269,7 @@ class TemperatureAwareHybridEngine:
         ]
 
     def _get_smart_chunks(self, df: pd.DataFrame, gap_start: int, gap_end: int) -> List[Tuple[int, int]]:
-        """Chunk a gap, keeping high-variance days together and preferring
-        day boundaries as break points."""
+        """Prefer day boundaries and keep high-variance days together."""
         chunks = []
         current_chunk_start = gap_start
         current_chunk_size = 0
@@ -309,7 +278,6 @@ class TemperatureAwareHybridEngine:
         gap_dates = df.loc[gap_start:gap_end - 1, 'DayOfWeek'].values
         gap_hours = df.loc[gap_start:gap_end - 1, 'Hour'].values
 
-        # Variance per day in gap (by day-of-week name)
         primary_site = self.site_cols[0] if self.site_cols else None
         site_variance = self._day_variance.get(primary_site, {}) if primary_site else {}
 
@@ -348,16 +316,12 @@ class TemperatureAwareHybridEngine:
         if current_chunk_start < gap_end:
             chunks.append((current_chunk_start, gap_end))
 
-        log.debug(f"[SMART-CHUNK] Identified {len(chunks)} chunks, high-var threshold: {v_threshold:.1f}")
+        log.debug(f"smart chunks: {len(chunks)}, high-var threshold: {v_threshold:.1f}")
         return chunks
 
-    # ─────────────────────────────────────────────────────────────────
-    # Multi-week templates
-    # ─────────────────────────────────────────────────────────────────
-
     def _build_weekly_templates(self, df: pd.DataFrame):
-        """28-day adaptive templates per (site, day-of-week, hour) with a
-        70/30 recency / historical bias."""
+        """28-day adaptive templates per (site, day-of-week, hour). Recent data
+        gets `adaptive_template_bias` weight, older data gets the rest."""
         try:
             max_date = df['Timestamp'].max()
             min_date = max_date - pd.Timedelta(days=self.template_lookback_days)
@@ -366,10 +330,8 @@ class TemperatureAwareHybridEngine:
             recent_mask = df['Timestamp'] >= recent_cutoff
             historical_mask = (df['Timestamp'] >= min_date) & (df['Timestamp'] < recent_cutoff)
 
-            # Exclude holidays from the per-day-of-week template. Otherwise a
-            # single holiday that happens to land on a given DoW (e.g. Easter
-            # Sunday) biases that DoW's template on every non-holiday
-            # occurrence of the same DoW.
+            # Exclude holidays from the per-DoW template. Otherwise Easter Sunday
+            # (say) poisons every non-holiday Sunday's template.
             non_holiday_mask = (
                 ~df['IsHoliday'] if 'IsHoliday' in df.columns else pd.Series(True, index=df.index)
             )
@@ -434,14 +396,13 @@ class TemperatureAwareHybridEngine:
                         self._day_variance[site][day_name] = float(np.std(day_values_all))
 
             log.info(
-                f"[EXTENDED-V2] Built adaptive weekly templates ({self.template_lookback_days}-day lookback, "
+                f"weekly templates built ({self.template_lookback_days}-day lookback, "
                 f"{int(self.adaptive_template_bias * 100)}% recency bias)"
             )
         except Exception as e:
-            log.error(f"[ERROR] Failed to build weekly templates: {e}")
+            log.error(f"failed to build weekly templates: {e}")
 
     def _fill_with_multi_week_template(self, df: pd.DataFrame, site: str, gap_start: int, gap_end: int):
-        """Fill a gap using per-(day, hour) medians from _weekly_templates."""
         try:
             hours = df.loc[gap_start:gap_end - 1, 'Hour'].values
             day_names = df.loc[gap_start:gap_end - 1, 'DayOfWeek'].values
@@ -498,15 +459,11 @@ class TemperatureAwareHybridEngine:
             })
 
         except Exception as e:
-            log.error(f"[ERROR] Multi-week template fill failed for {site}: {e}")
+            log.error(f"multi-week template fill failed for {site}: {e}")
             self._fill_safe_median_template(df, site, gap_start, gap_end)
 
-    # ─────────────────────────────────────────────────────────────────
-    # Occupancy + external features
-    # ─────────────────────────────────────────────────────────────────
-
     def _add_occupancy_features(self, df: pd.DataFrame):
-        """Derive IsOccupied / OccupancyType from calendar heuristics."""
+        """Derive IsOccupied / OccupancyType from weekend, holiday, and hour."""
         try:
             df['OccupancyType'] = 'work_hours'
             df['IsOccupied'] = True
@@ -530,14 +487,13 @@ class TemperatureAwareHybridEngine:
             df.loc[evening_mask & ~weekend_mask & work_hours_mask, 'OccupancyType'] = 'evening'
             df.loc[evening_mask & ~weekend_mask & work_hours_mask, 'IsOccupied'] = False
 
-            log.info("[EXTENDED] Added occupancy features")
+            log.info("occupancy features added")
         except Exception as e:
-            log.error(f"[ERROR] Failed to add occupancy features: {e}")
+            log.error(f"failed to add occupancy features: {e}")
             df['IsOccupied'] = True
             df['OccupancyType'] = 'unknown'
 
     def _add_external_features(self, df: pd.DataFrame):
-        """Add IsHoliday / IsSpecialDay / Season / event / weather-spike flags."""
         try:
             df['IsHoliday'] = df['Date'].isin(FRANCE_HOLIDAYS_2026)
             df['IsSpecialDay'] = (
@@ -579,13 +535,9 @@ class TemperatureAwareHybridEngine:
                 9: 'fall', 10: 'fall', 11: 'fall',
             })
 
-            log.info("[EXTENDED-V2] Added rich external features (holiday close, event days, weather spikes)")
+            log.info("external features added (holiday close, events, weather spikes)")
         except Exception as e:
-            log.error(f"[ERROR] Failed to add external features: {e}")
-
-    # ─────────────────────────────────────────────────────────────────
-    # Uncertainty bounds + confidence
-    # ─────────────────────────────────────────────────────────────────
+            log.error(f"failed to add external features: {e}")
 
     def _build_uncertainty_bounds(self, df: pd.DataFrame):
         try:
@@ -605,11 +557,11 @@ class TemperatureAwareHybridEngine:
                 upper_bound = mean + 2 * std
 
                 self._uncertainty_bounds[site] = (lower_bound, upper_bound)
-                log.debug(f"[UNCERTAINTY] {site}: bounds ({lower_bound:.1f}, {upper_bound:.1f})")
+                log.debug(f"{site} bounds ({lower_bound:.1f}, {upper_bound:.1f})")
 
-            log.info("[EXTENDED] Built uncertainty bounds")
+            log.info("uncertainty bounds built")
         except Exception as e:
-            log.error(f"[ERROR] Failed to build uncertainty bounds: {e}")
+            log.error(f"failed to build uncertainty bounds: {e}")
 
     def _calculate_confidence_with_uncertainty(
         self,
@@ -664,7 +616,7 @@ class TemperatureAwareHybridEngine:
             confidence = strategy_factor * gap_factor * occupancy_factor * holiday_factor
             return float(np.clip(confidence, 0.0, 1.0))
         except Exception as e:
-            log.debug(f"[DEBUG] Confidence calculation failed: {e}")
+            log.debug(f"confidence calc failed: {e}")
             return 0.5
 
     def _flag_low_confidence(
@@ -676,8 +628,6 @@ class TemperatureAwareHybridEngine:
         confidence: float,
         strategy: str,
     ):
-        """Flag gaps with confidence < 0.5 for manual review. Takes `df`
-        explicitly so the occupancy / holiday context can be recorded."""
         if confidence >= 0.50:
             return
 
@@ -703,13 +653,8 @@ class TemperatureAwareHybridEngine:
             'reason': 'low_confidence_score',
         })
 
-    # ─────────────────────────────────────────────────────────────────
-    # Intelligent router
-    # ─────────────────────────────────────────────────────────────────
-
     def _intelligent_router(self, df: pd.DataFrame, site: str, gap_start: int, gap_end: int):
-        """Route a gap to a fill strategy based on size, meter tier,
-        and weekend / entry context."""
+        """Pick a fill strategy based on gap size, meter tier, and weekend context."""
         gap_size = gap_end - gap_start
         meter_tier = METER_HIERARCHY.get(site, {}).get('tier', 'unknown')
         is_weekend = self._is_weekend_gap(df, gap_start, gap_end)
@@ -779,7 +724,7 @@ class TemperatureAwareHybridEngine:
         except Exception:
             pass
 
-        # Confidence map keys on the canonical strategy (strip WEEKEND_TEMPLATE_* suffix)
+        # Confidence map keys on the base name (strip WEEKEND_TEMPLATE_* suffix)
         canonical_strategy = 'WEEKEND_TEMPLATE' if strategy.startswith('WEEKEND_TEMPLATE') else strategy
         confidence = self._calculate_confidence_with_uncertainty(
             site, gap_size, day_type, canonical_strategy, occupancy_type, is_holiday
@@ -800,10 +745,6 @@ class TemperatureAwareHybridEngine:
             'is_holiday': is_holiday,
         })
 
-    # ─────────────────────────────────────────────────────────────────
-    # Fill strategies
-    # ─────────────────────────────────────────────────────────────────
-
     def _fill_linear(self, df: pd.DataFrame, site: str, gap_start: int, gap_end: int):
         try:
             left_val = df.loc[gap_start - 1, site] if gap_start > 0 else np.nan
@@ -816,7 +757,7 @@ class TemperatureAwareHybridEngine:
             filled = np.linspace(left_val, right_val, gap_end - gap_start + 2)[1:-1]
             df.loc[gap_start:gap_end - 1, site] = filled
         except Exception as e:
-            log.error(f"[ERROR] Linear fill failed for {site}: {e}")
+            log.error(f"linear fill failed for {site}: {e}")
             self._fill_safe_median_template(df, site, gap_start, gap_end)
 
     def _fill_weekend_template(self, df: pd.DataFrame, site: str, gap_start: int, gap_end: int, day_type: str):
@@ -831,7 +772,7 @@ class TemperatureAwareHybridEngine:
             filled_vals = self._validate_and_clip(filled_vals, site, df)
             df.loc[gap_start:gap_end - 1, site] = filled_vals
         except Exception as e:
-            log.error(f"[ERROR] Weekend template fill failed: {e}")
+            log.error(f"weekend template fill failed: {e}")
             self._fill_safe_median_template(df, site, gap_start, gap_end)
 
     def _fill_with_thermal_template(self, df: pd.DataFrame, site: str, gap_start: int, gap_end: int):
@@ -849,7 +790,7 @@ class TemperatureAwareHybridEngine:
             filled_vals = self._validate_and_clip(filled_vals, site, df)
             df.loc[gap_start:gap_end - 1, site] = filled_vals
         except Exception as e:
-            log.error(f"[ERROR] Thermal template failed: {e}")
+            log.error(f"thermal template failed: {e}")
             self._fill_safe_median_template(df, site, gap_start, gap_end)
 
     def _fill_enhanced_template(self, df: pd.DataFrame, site: str, gap_start: int, gap_end: int):
@@ -872,7 +813,7 @@ class TemperatureAwareHybridEngine:
 
             df.loc[gap_start:gap_end - 1, site] = filled
         except Exception as e:
-            log.error(f"[ERROR] Safe linear-median failed: {e}")
+            log.error(f"safe linear-median failed: {e}")
             self._fill_safe_median_template(df, site, gap_start, gap_end)
 
     def _fill_safe_median_template(self, df: pd.DataFrame, site: str, gap_start: int, gap_end: int):
@@ -883,7 +824,7 @@ class TemperatureAwareHybridEngine:
             else:
                 df.loc[gap_start:gap_end - 1, site] = 0.0
         except Exception as e:
-            log.error(f"[ERROR] Safe median failed: {e}")
+            log.error(f"safe median failed: {e}")
             df.loc[gap_start:gap_end - 1, site] = 0.0
 
     def _fill_via_peer_correlation(self, df: pd.DataFrame, child: str, parent: str, gap_start: int, gap_end: int):
@@ -894,12 +835,10 @@ class TemperatureAwareHybridEngine:
             filled_vals = self._validate_and_clip(filled_vals, child, df)
             df.loc[gap_start:gap_end - 1, child] = filled_vals
         except Exception as e:
-            log.error(f"[ERROR] Peer correlation failed: {e}")
+            log.error(f"peer correlation failed: {e}")
             self._fill_safe_median_template(df, child, gap_start, gap_end)
 
-    # ─────────────────────────────────────────────────────────────────
-    # ML stubs (disabled by default; kept as placeholders for future work)
-    # ─────────────────────────────────────────────────────────────────
+    # ML stubs, disabled by default, never wired up.
 
     def _fill_with_mice(self, df: pd.DataFrame, site: str, gap_start: int, gap_end: int, iterations: int = 3):
         return False
@@ -910,10 +849,6 @@ class TemperatureAwareHybridEngine:
     def _fill_with_knn_context(self, df: pd.DataFrame, site: str, gap_start: int, gap_end: int, k: int = 5):
         return False
 
-    # ─────────────────────────────────────────────────────────────────
-    # Validation + smoothing + final NaN guard
-    # ─────────────────────────────────────────────────────────────────
-
     def _apply_edge_calibration(
         self,
         df: pd.DataFrame,
@@ -923,22 +858,14 @@ class TemperatureAwareHybridEngine:
         gap_end: int,
         lookback: int = 144,
     ) -> np.ndarray:
-        """Scale template fills so their level matches real data adjacent
-        to the gap.
+        """Scale a template fill so its level matches real data next to the gap.
 
-        The multi-week template is a 28-day blend (70% recent / 30% older)
-        and preserves shape well but can be biased on absolute level when
-        consumption is trending. Without edge anchoring, end-of-window
-        reconstructions (e.g. imputing the day after the last real day)
-        come out systematically ~20% too high.
-
-        The correction is a single multiplicative scale computed from the
-        24h of real data next to the gap:
-            scale = mean(actual) / mean(template_predictions_at_same_slots)
-        Clipped to [0.5, 2.0] to guard against degenerate calibration
-        windows. Returns `filled_vals` unchanged when no side has enough
-        real data to calibrate against.
-        """
+        The 28-day 70/30 blended template preserves shape well but drifts on
+        absolute level when consumption is trending. Without this anchor,
+        reconstructions at the end of the window (e.g. imputing the day after
+        the last real day) come out ~20% too high systematically. We compute
+        `scale = mean(actual) / mean(template_at_same_slots)` over the 24h
+        of real data next to the gap, clip to [0.5, 2.0], and multiply."""
         scale = self._compute_template_scale(df, site, max(0, gap_start - lookback), gap_start)
         if scale is None:
             scale = self._compute_template_scale(df, site, gap_end, min(len(df), gap_end + lookback))
@@ -946,7 +873,7 @@ class TemperatureAwareHybridEngine:
             return filled_vals
 
         if abs(scale - 1.0) > 0.005:
-            log.debug(f"[CALIBRATION] {site} gap[{gap_start}:{gap_end}] scale={scale:.3f}")
+            log.debug(f"{site} gap[{gap_start}:{gap_end}] calibration scale={scale:.3f}")
         return filled_vals * scale
 
     def _compute_template_scale(
@@ -956,10 +883,6 @@ class TemperatureAwareHybridEngine:
         cal_start: int,
         cal_end: int,
     ) -> Optional[float]:
-        """Ratio of real data mean to template-prediction mean over the
-        `[cal_start, cal_end)` window. Returns None when fewer than 12
-        paired (real, template) points are available or when the predicted
-        mean is non-positive."""
         if cal_end <= cal_start:
             return None
 
@@ -1046,11 +969,7 @@ class TemperatureAwareHybridEngine:
                 except Exception:
                     pass
         except Exception as e:
-            log.debug(f"[DEBUG] Smoothing failed: {e}")
-
-    # ─────────────────────────────────────────────────────────────────
-    # Helper pipeline steps
-    # ─────────────────────────────────────────────────────────────────
+            log.debug(f"smoothing failed: {e}")
 
     def _add_datetime_features(self, df: pd.DataFrame):
         df['Hour'] = df['Timestamp'].dt.hour
@@ -1110,7 +1029,7 @@ class TemperatureAwareHybridEngine:
                     continue
                 self._seasonal_templates[site] = {}
         except Exception as e:
-            log.debug(f"[DEBUG] Seasonal templates failed: {e}")
+            log.debug(f"seasonal templates failed: {e}")
 
     def _build_peer_ratios(self, df: pd.DataFrame):
         for site, info in METER_HIERARCHY.items():
@@ -1156,11 +1075,7 @@ class TemperatureAwareHybridEngine:
                             float(corr) if not np.isnan(corr) else 0.0
                         )
         except Exception as e:
-            log.debug(f"[DEBUG] Multi-site correlation failed: {e}")
-
-    # ─────────────────────────────────────────────────────────────────
-    # Gap utilities
-    # ─────────────────────────────────────────────────────────────────
+            log.debug(f"multi-site correlation failed: {e}")
 
     def _is_weekend_gap(self, df: pd.DataFrame, gap_start: int, gap_end: int) -> bool:
         dow_values = df.loc[gap_start:gap_end - 1, 'DayOfWeek'].unique()
@@ -1201,10 +1116,6 @@ class TemperatureAwareHybridEngine:
         gaps.append((start, int(indices[-1]) + 1))
         return gaps
 
-    # ─────────────────────────────────────────────────────────────────
-    # Reports
-    # ─────────────────────────────────────────────────────────────────
-
     def get_low_confidence_report(self) -> pd.DataFrame:
         if not self._low_confidence_flags:
             return pd.DataFrame()
@@ -1215,18 +1126,10 @@ class TemperatureAwareHybridEngine:
             return pd.DataFrame()
         return pd.DataFrame(self.strategy_log)
 
-    # ─────────────────────────────────────────────────────────────────
-    # Legacy compatibility shims (kept so external callers relying on the
-    # old TemperatureAwareHybridEngine surface do not break)
-    # ─────────────────────────────────────────────────────────────────
-
     def get_strategy_summary(self) -> pd.DataFrame:
-        """Legacy alias. Returns strategy_log as a DataFrame."""
         return self.get_strategy_log()
 
     def get_sensor_health(self) -> Dict[str, float]:
-        """Legacy shim, returns a flat 100.0 score per configured site.
-        The new algorithm does not compute per-sensor health scores."""
         return {site: 100.0 for site in self.site_cols}
 
     def integrate_weather_forecast(
@@ -1237,13 +1140,10 @@ class TemperatureAwareHybridEngine:
         end_idx: int,
         temp_forecast: np.ndarray,
     ):
-        """Legacy shim, no-op. Forecast-aware enhancement is not implemented
-        in this algorithm."""
-        log.debug("[LEGACY] integrate_weather_forecast called; no-op in the new engine")
+        log.debug("integrate_weather_forecast called; no-op")
         return
 
     def cache_templates(self, fingerprint: str = ''):
-        """Legacy shim, best-effort pickle of the weekly templates."""
         if not self._weekly_templates:
             return
         try:
@@ -1255,9 +1155,9 @@ class TemperatureAwareHybridEngine:
             os.makedirs(os.path.dirname(self.template_cache_file) or '.', exist_ok=True)
             with open(self.template_cache_file, 'wb') as f:
                 pickle.dump(payload, f)
-            log.debug(f"[LEGACY] Templates cached to {self.template_cache_file}")
+            log.debug(f"templates cached to {self.template_cache_file}")
         except Exception as e:
-            log.debug(f"[LEGACY] cache_templates write failed: {e}")
+            log.debug(f"cache_templates write failed: {e}")
 
     def benchmark(
         self,
@@ -1267,6 +1167,5 @@ class TemperatureAwareHybridEngine:
         n_runs: int = 20,
         random_state: int = 42,
     ) -> pd.DataFrame:
-        """Legacy shim, returns an empty DataFrame with the old columns."""
-        log.debug("[LEGACY] benchmark called; returning empty frame in the new engine")
+        log.debug("benchmark called; returning empty frame")
         return pd.DataFrame(columns=['site', 'gap_length', 'run', 'strategy', 'mae', 'rmse'])
