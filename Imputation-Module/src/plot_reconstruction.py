@@ -104,14 +104,12 @@ def render(
         handles.append(Patch(facecolor="0.85", alpha=0.4,
                              label="Test-mode masked range"))
 
-    # Push the ymax up so the upper-right legend doesn't sit on top of the curve.
-    ymin, ymax = ax.get_ylim()
-    ax.set_ylim(ymin, ymax + (ymax - ymin) * 0.18)
-    ax.legend(handles=handles, loc="upper right", fontsize=9)
+    ax.legend(handles=handles, loc="upper left",
+              bbox_to_anchor=(1.02, 1.0), borderaxespad=0, fontsize=9)
 
     fig.autofmt_xdate()
     fig.tight_layout()
 
     os.makedirs(os.path.dirname(png_path) or ".", exist_ok=True)
-    fig.savefig(png_path, dpi=150)
+    fig.savefig(png_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
