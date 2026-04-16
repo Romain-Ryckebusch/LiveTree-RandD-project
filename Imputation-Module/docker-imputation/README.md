@@ -1,7 +1,7 @@
 # docker-imputation
 
 Standalone Docker container for the Phase 2 **module de pilotage**. Wraps
-`phase-2/Imputation-Module/src/imputer.py` (backed by
+`Imputation-Module/src/imputer.py` (backed by
 `TemperatureAwareHybridEngine`) and feeds it either a CSV of a 7-day
 `Ptot_HA` window or a live pull from the production Cassandra cluster.
 Returns the imputed series plus per-point quality flags.
@@ -9,12 +9,12 @@ Returns the imputed series plus per-point quality flags.
 ## Build
 
 ```bash
-cd "phase-2/Imputation-Module/docker-imputation"
+cd "Imputation-Module/docker-imputation"
 docker compose build
 ```
 
 The build context is the project root so the Dockerfile can `COPY` from
-`phase-2/Imputation-Module/src/`. First build is ~3-5 minutes; subsequent
+`Imputation-Module/src/`. First build is ~3-5 minutes; subsequent
 builds reuse the pip layer.
 
 ## Run
@@ -105,7 +105,7 @@ Constraints (CLI exits non-zero on violation):
 ### Cassandra mode input
 
 No input file. The container reads from the tables listed in
-`phase-2/Imputation-Module/src/config.py`:
+`Imputation-Module/src/config.py`:
 
 - `conso_historiques_clean` (partition key `Conso_Data`)
 - `pv_prev_meteo_clean` (partition key `Meteorological_Prevision_Data`)
@@ -138,7 +138,7 @@ Same contract in both modes:
 
 | Host path                               | Container path  | Mode |
 |-----------------------------------------|-----------------|------|
-| `phase-2/data/`                         | `/data/`        | ro   |
+| `data/`                         | `/data/`        | ro   |
 | `./io/`                                 | `/io/`          | rw   |
 | `./cache/`                              | `/app/cache/`   | rw   |
 
