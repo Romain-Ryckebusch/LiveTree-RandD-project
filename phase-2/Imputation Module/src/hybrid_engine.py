@@ -1,38 +1,116 @@
+"""
+TemperatureAwareHybridEngine, deployment gap recovery algorithm.
 
-# HYBRID ENGINE (FIXED VERSION)
+This module replaces the previous hybrid engine with the extended
+deployment-gap-recovery algorithm (formerly ExtendedDeploymentAlgorithm at
+the repo root). The class name `TemperatureAwareHybridEngine` and its
+constructor / attribute surface are preserved so `imputer.py`,
+`impute_cli.py`, and the Docker stack continue to work unchanged.
+
+Key features:
+  - Multi-week (28-day) adaptive templates with recency bias
+  - Smart chunked recovery for long gaps (7+ days)
+  - Occupancy + calendar + weather external features
+  - Uncertainty bounds and low-confidence flagging
+  - Peer-correlation fill for sub-meters via meter hierarchy
+"""
+
 import hashlib
-import pandas as pd
-import numpy as np
-from scipy.interpolate import CubicSpline
-from scipy.signal import savgol_filter
-from scipy.fft import fft
-from typing import Dict, Optional, Tuple, List
-from datetime import date
-import pickle
+import logging
 import os
+import pickle
+from datetime import date, timedelta
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+from scipy.signal import savgol_filter
+from scipy.signal import lfilter
+from scipy.stats import gaussian_kde
+from sklearn.neighbors import NearestNeighbors
 
 try:
     from sklearn.ensemble import IsolationForest
 except ImportError:
     IsolationForest = None
 
+log = logging.getLogger(__name__)
+
 SITE_COLS = ['Ptot_HA', 'Ptot_HEI', 'Ptot_HEI_13RT', 'Ptot_HEI_5RNS', 'Ptot_RIZOMM', 'Ptot_Ilot']
 
-def _default_holidays():
-    """Hardcoded fallback list of major 2026 French bank holidays."""
-    holidays = set()
-    for m, d in [
+METER_HIERARCHY = {
+    'Ptot_HEI': {
+        'parent': None,
+        'children': ['Ptot_HEI_13RT', 'Ptot_HEI_5RNS'],
+        'tier': 'main',
+    },
+    'Ptot_HEI_13RT': {
+        'parent': 'Ptot_HEI',
+        'children': [],
+        'tier': 'sub',
+    },
+    'Ptot_HEI_5RNS': {
+        'parent': 'Ptot_HEI',
+        'children': [],
+        'tier': 'sub',
+    },
+    'Ptot_HA': {
+        'parent': None,
+        'children': [],
+        'tier': 'entry',
+    },
+    'Ptot_RIZOMM': {
+        'parent': None,
+        'children': [],
+        'tier': 'entry',
+    },
+}
+
+
+def _load_all_holidays():
+    """Load holidays / close days / special days from any per-year CSVs that
+    happen to be present, falling back to a hardcoded 2026 list when the
+    files are missing (current production state)."""
+    holidays: set = set()
+    close_days: set = set()
+    special_days: set = set()
+    years = [2021, 2022, 2023, 2024, 2025, 2026]
+
+    for year in years:
+        file_map = {'Holiday': holidays, 'Close': close_days, 'Special': special_days}
+        for ftype, target_set in file_map.items():
+            fname = f'data/Consumption_{year}_{ftype}.csv'
+            try:
+                df = pd.read_csv(fname, header=0, names=['date'], parse_dates=['date'])
+                target_set.update(df['date'].dt.date.unique())
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
+
+    fallback_holidays = [
         (1, 1), (4, 5), (4, 6), (5, 1), (5, 8), (5, 14), (5, 25),
         (7, 14), (8, 15), (11, 1), (11, 11), (12, 25),
-    ]:
+    ]
+    for m, d in fallback_holidays:
         holidays.add(date(2026, m, d))
-    return holidays, set(), set()
 
-FRANCE_HOLIDAYS_2026, FRANCE_CLOSE_DAYS_2026, FRANCE_SPECIAL_DAYS_2026 = _default_holidays()
+    return holidays, close_days, special_days
+
+
+FRANCE_HOLIDAYS_2026, FRANCE_CLOSE_DAYS_2026, FRANCE_SPECIAL_DAYS_2026 = _load_all_holidays()
 
 
 class TemperatureAwareHybridEngine:
-    """Hybrid gap-filling: temperature + anomaly + peer correlation + confidence bounds + health scoring."""
+    """Deployment gap-recovery engine with multi-week templates, smart
+    chunking, occupancy awareness and uncertainty bounds.
+
+    The class name and the five legacy kwargs (`site_cols`, `weather_df`,
+    `use_historical_data`, `template_cache_file`, `low_variance_threshold`)
+    are preserved for compatibility with `imputer.py`. The ML stub flags
+    (`use_mice`, `use_knn`, `use_kalman`, `use_deep_learning`) default to
+    `False`: the underlying methods in this script are placeholders.
+    """
 
     def __init__(
         self,
@@ -41,48 +119,93 @@ class TemperatureAwareHybridEngine:
         use_historical_data: bool = True,
         template_cache_file: str = 'templates_cache.pkl',
         low_variance_threshold: float = 5000.0,
+        use_mice: bool = False,
+        use_knn: bool = False,
+        use_kalman: bool = False,
+        use_deep_learning: bool = False,
+        use_multi_week_templates: bool = True,
+        use_chunked_recovery: bool = True,
+        gap_chunk_size: int = 96,
+        occupancy_data: Optional[pd.DataFrame] = None,
+        calendar_data: Optional[pd.DataFrame] = None,
+        template_lookback_days: int = 28,
+        use_smart_chunking: bool = True,
+        adaptive_template_bias: float = 0.7,
     ):
         self.site_cols = site_cols or SITE_COLS
         self.weather_df = weather_df
-        self.low_variance_threshold = low_variance_threshold
-        self.holidays = FRANCE_HOLIDAYS_2026
-        self.close_days = FRANCE_CLOSE_DAYS_2026   # Site-specific closures (near-zero load)
-        self.special_days = FRANCE_SPECIAL_DAYS_2026  # Special patterns (bridges, academic)
-        self._holidays_array = np.array(sorted(list(FRANCE_HOLIDAYS_2026)), dtype='datetime64[D]')
-        self._close_days_array = np.array(sorted(list(self.close_days)), dtype='datetime64[D]')
-        self._special_days_array = np.array(sorted(list(self.special_days)), dtype='datetime64[D]')
         self.use_historical_data = use_historical_data
-        self.historical_df = None
+        self.historical_df: Optional[pd.DataFrame] = None
+        self.template_cache_file = template_cache_file
+        self.low_variance_threshold = low_variance_threshold
 
-        self.anomaly_scores: Dict = {}
-        self.confidence_bounds: Dict = {}
-        self.peer_correlations: Dict = {}
+        self.use_mice = use_mice
+        self.use_knn = use_knn
+        self.use_kalman = use_kalman
+        self.use_deep_learning = use_deep_learning
+        self.use_multi_week_templates = use_multi_week_templates
+        self.use_chunked_recovery = use_chunked_recovery
+        self.gap_chunk_size = gap_chunk_size
+        self.occupancy_data = occupancy_data
+        self.calendar_data = calendar_data
+        self.template_lookback_days = template_lookback_days
+        self.use_smart_chunking = use_smart_chunking
+        self.adaptive_template_bias = adaptive_template_bias
+
         self.strategy_log: List[Dict] = []
-        self._templates: Optional[Dict] = None
-        self._rolling: Optional[Dict] = None
-        self._template_cache_file = template_cache_file
-        self._cache_fingerprint: Optional[str] = None
-        self._hm_cache: Dict = {}  # Cache for time-of-day formatting
+        self._peer_ratios: Dict[str, float] = {}
+        self.templates: Dict = {}
 
-        if self.use_historical_data:
-            try:
-                self.historical_df = self._load_expanded_historical_data()
-                if self.historical_df is not None:
-                    print(f"[OK] Loaded {len(self.historical_df):,} historical records (2021-2025)")
-                else:
-                    print("[WARN] Historical data not found")
-            except Exception as e:
-                print(f"[WARN] Error loading historical data: {e}")
+        self._kalman_states: Dict[str, np.ndarray] = {}
+        self._kalman_covariance: Dict[str, float] = {}
+        self._knn_models: Dict[str, NearestNeighbors] = {}
+        self._fitted_knn: bool = False
 
-        self._load_cached_templates()
+        self._reconstruction_confidence: Dict[str, float] = {}
+        self._low_confidence_flags: List[Dict] = []
+        self._seasonal_templates: Dict[str, Dict] = {}
+        self._multi_site_correlations: Dict[str, Dict[str, float]] = {}
+
+        self._weekly_templates: Dict[str, Dict[str, Dict]] = {}
+        self._uncertainty_bounds: Dict[str, Tuple[float, float]] = {}
+        self._occupancy_patterns: Dict[str, Dict] = {}
+        self._day_variance: Dict[str, Dict[str, float]] = {}
+        self._external_event_flags: Dict[str, List[str]] = {}
+        self._weather_variance: Dict[str, float] = {}
+
+    # ─────────────────────────────────────────────────────────────────
+    # Main entry point
+    # ─────────────────────────────────────────────────────────────────
 
     def impute(self, df: pd.DataFrame, weather_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
-        """Detect gaps, route by size, apply all resilience layers."""
-        if weather_df is not None:
-            self.weather_df = weather_df
+        """Impute gaps with multi-week templates, smart chunking, and
+        occupancy-aware features. Output preserves the input's
+        `Timestamp` + site columns (+ optional `AirTemp`).
+        """
+        self.strategy_log = []
 
         df = df.copy().sort_values('Timestamp').reset_index(drop=True)
-        if self.weather_df is not None:
+
+        # Prepend injected historical data (imputer.py sets self.historical_df)
+        if (
+            self.use_historical_data
+            and self.historical_df is not None
+            and isinstance(self.historical_df, pd.DataFrame)
+            and not self.historical_df.empty
+            and 'Timestamp' in self.historical_df.columns
+        ):
+            df_start = df['Timestamp'].min()
+            hist_past = self.historical_df[self.historical_df['Timestamp'] < df_start]
+            if not hist_past.empty:
+                df = (
+                    pd.concat([hist_past, df], ignore_index=True, sort=False)
+                    .drop_duplicates(subset=['Timestamp'], keep='last')
+                    .sort_values('Timestamp')
+                    .reset_index(drop=True)
+                )
+
+        if weather_df is not None:
+            self.weather_df = weather_df
             df = self._merge_weather(df)
 
         start = df['Timestamp'].min().floor('10min')
@@ -94,59 +217,937 @@ class TemperatureAwareHybridEngine:
         )
         df.columns = ['Timestamp'] + list(df.columns[1:])
 
-        self._fill_airtemp(df)
+        self._add_datetime_features(df)
+        self._fill_airtemp_forward(df)
+        self._classify_thermal_regimes(df)
 
-        self._hm_cache = {}
-        if 'Timestamp' in df.columns:
-            # pd.DatetimeIndex yields pd.Timestamp; a bare .unique() on a
-            # datetime64 Series returns numpy.datetime64 in pandas 1.0.x.
-            for ts in pd.DatetimeIndex(df['Timestamp'].unique()):
-                hm = f"{ts.hour:02d}:{ts.minute:02d}"
-                self._hm_cache[ts] = hm
+        self._add_occupancy_features(df)
+        self._add_external_features(df)
 
-        self._detect_anomalies(df)
-        self._calculate_peer_correlations(df)
-        bounds = self._calculate_bounds(df)
-        self.strategy_log = []
+        self._build_peer_ratios(df)
+
+        self._build_day_specific_templates(df)
+        self._build_seasonal_templates(df)
+
+        if self.use_multi_week_templates:
+            self._build_weekly_templates(df)
+            self._build_uncertainty_bounds(df)
+
+        self._build_multi_site_correlations(df)
 
         for site in self.site_cols:
             if site not in df.columns:
                 continue
+
             gap_mask = df[site].isna()
             if not gap_mask.any():
                 continue
 
             for gap_start, gap_end in self._find_gap_groups(gap_mask):
-                self._route_gap_7layer(df, site, gap_start, gap_end, log_strategy=True)
+                gap_size = gap_end - gap_start
+                if self.use_chunked_recovery and gap_size > self.gap_chunk_size:
+                    self._fill_chunked_gap(df, site, gap_start, gap_end)
+                else:
+                    self._intelligent_router(df, site, gap_start, gap_end)
 
-            if site in bounds:
-                df[site] = df[site].clip(*bounds[site])
+        self._nan_guard_final_pass(df)
 
-        self._compute_output_confidence_bounds(df)
+        for site in self.site_cols:
+            if site in df.columns:
+                self._smooth_junctions(df, site)
+
         out_cols = ['Timestamp'] + self.site_cols + (['AirTemp'] if 'AirTemp' in df.columns else [])
         return df[[c for c in out_cols if c in df.columns]]
 
+    # ─────────────────────────────────────────────────────────────────
+    # Chunked gap recovery
+    # ─────────────────────────────────────────────────────────────────
+
+    def _fill_chunked_gap(self, df: pd.DataFrame, site: str, gap_start: int, gap_end: int):
+        """Split long gaps into chunks, smart-chunking when enabled."""
+        gap_size = gap_end - gap_start
+
+        if self.use_smart_chunking:
+            try:
+                chunks = self._get_smart_chunks(df, gap_start, gap_end)
+            except Exception as e:
+                log.debug(f"[DEBUG] Smart chunking failed: {e}; falling back to fixed-size chunks")
+                chunks = self._fixed_size_chunks(gap_start, gap_end)
+            log.info(f"[CHUNKED-SMART] Splitting {gap_size} points ({site}) into {len(chunks)} smart chunks")
+        else:
+            chunks = self._fixed_size_chunks(gap_start, gap_end)
+            log.info(f"[CHUNKED] Splitting {gap_size} points ({site}) into {len(chunks)} chunks")
+
+        for chunk_idx, (chunk_start, chunk_end) in enumerate(chunks):
+            chunk_size = chunk_end - chunk_start
+
+            if self.use_multi_week_templates and self._weekly_templates:
+                self._fill_with_multi_week_template(df, site, chunk_start, chunk_end)
+            else:
+                self._intelligent_router(df, site, chunk_start, chunk_end)
+
+            log.debug(f"[CHUNKED] Filled chunk {chunk_idx+1}/{len(chunks)}: "
+                      f"indices {chunk_start}-{chunk_end}, size {chunk_size}")
+
+    def _fixed_size_chunks(self, gap_start: int, gap_end: int) -> List[Tuple[int, int]]:
+        gap_size = gap_end - gap_start
+        num_chunks = int(np.ceil(gap_size / self.gap_chunk_size))
+        return [
+            (gap_start + (i * self.gap_chunk_size),
+             min(gap_start + ((i + 1) * self.gap_chunk_size), gap_end))
+            for i in range(num_chunks)
+        ]
+
+    def _get_smart_chunks(self, df: pd.DataFrame, gap_start: int, gap_end: int) -> List[Tuple[int, int]]:
+        """Chunk a gap, keeping high-variance days together and preferring
+        day boundaries as break points."""
+        chunks = []
+        current_chunk_start = gap_start
+        current_chunk_size = 0
+        max_chunk_size = self.gap_chunk_size * 1.5
+
+        gap_dates = df.loc[gap_start:gap_end - 1, 'DayOfWeek'].values
+        gap_hours = df.loc[gap_start:gap_end - 1, 'Hour'].values
+
+        # Variance per day in gap (by day-of-week name)
+        primary_site = self.site_cols[0] if self.site_cols else None
+        site_variance = self._day_variance.get(primary_site, {}) if primary_site else {}
+
+        daily_variances: List[float] = []
+        for i, hour in enumerate(gap_hours):
+            if hour == 0 or i == 0:
+                day_name = gap_dates[i]
+                v = site_variance.get(day_name)
+                daily_variances.append(float(v) if v is not None else 100.0)
+
+        v_threshold = float(np.median(daily_variances)) if daily_variances else 100.0
+        high_variance_days = set()
+        for i in range(len(gap_dates)):
+            day_idx = i // 144
+            if day_idx < len(daily_variances) and daily_variances[day_idx] > v_threshold * 1.3:
+                high_variance_days.add(gap_dates[i])
+
+        for idx in range(gap_start, gap_end):
+            current_chunk_size += 1
+            is_high_variance = gap_dates[idx - gap_start] in high_variance_days
+            is_new_day = (gap_hours[idx - gap_start] == 0) and idx > gap_start
+
+            should_chunk_break = False
+            if current_chunk_size >= max_chunk_size:
+                should_chunk_break = True
+            elif is_high_variance and current_chunk_size > self.gap_chunk_size * 0.8:
+                should_chunk_break = True
+            elif is_new_day and current_chunk_size >= self.gap_chunk_size:
+                should_chunk_break = True
+
+            if should_chunk_break and idx < gap_end:
+                chunks.append((current_chunk_start, idx))
+                current_chunk_start = idx
+                current_chunk_size = 0
+
+        if current_chunk_start < gap_end:
+            chunks.append((current_chunk_start, gap_end))
+
+        log.debug(f"[SMART-CHUNK] Identified {len(chunks)} chunks, high-var threshold: {v_threshold:.1f}")
+        return chunks
+
+    # ─────────────────────────────────────────────────────────────────
+    # Multi-week templates
+    # ─────────────────────────────────────────────────────────────────
+
+    def _build_weekly_templates(self, df: pd.DataFrame):
+        """28-day adaptive templates per (site, day-of-week, hour) with a
+        70/30 recency / historical bias."""
+        try:
+            max_date = df['Timestamp'].max()
+            min_date = max_date - pd.Timedelta(days=self.template_lookback_days)
+
+            recent_cutoff = max_date - pd.Timedelta(days=int(self.template_lookback_days * 0.3))
+            recent_mask = df['Timestamp'] >= recent_cutoff
+            historical_mask = (df['Timestamp'] >= min_date) & (df['Timestamp'] < recent_cutoff)
+
+            for site in self.site_cols:
+                if site not in df.columns:
+                    continue
+
+                self._weekly_templates[site] = {}
+                self._day_variance[site] = {}
+
+                for day_name in ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']:
+                    day_templates = {}
+                    day_values_all = []
+
+                    for hour in range(24):
+                        recent = df.loc[
+                            recent_mask & (df['DayOfWeek'] == day_name) &
+                            (df['Hour'] == hour) & (df[site].notna()), site
+                        ].values
+
+                        historical = df.loc[
+                            historical_mask & (df['DayOfWeek'] == day_name) &
+                            (df['Hour'] == hour) & (df[site].notna()), site
+                        ].values
+
+                        if len(recent) > 0 and len(historical) > 0:
+                            recent_median = np.median(recent)
+                            historical_median = np.median(historical)
+                            blended_median = (
+                                self.adaptive_template_bias * recent_median
+                                + (1 - self.adaptive_template_bias) * historical_median
+                            )
+                            all_values = np.concatenate([recent, historical])
+                        elif len(recent) > 0:
+                            blended_median = np.median(recent)
+                            all_values = recent
+                        elif len(historical) > 0:
+                            blended_median = np.median(historical)
+                            all_values = historical
+                        else:
+                            blended_median = None
+                            all_values = np.array([])
+
+                        if len(all_values) > 0:
+                            day_templates[hour] = {
+                                'median': blended_median,
+                                'mean': float(np.mean(all_values)),
+                                'std': float(np.std(all_values)),
+                                'q25': float(np.percentile(all_values, 25)),
+                                'q75': float(np.percentile(all_values, 75)),
+                                'recent_count': int(len(recent)),
+                                'historical_count': int(len(historical)),
+                                'all_values': all_values[:100].copy(),
+                            }
+                            day_values_all.extend(all_values)
+                        else:
+                            day_templates[hour] = None
+
+                    self._weekly_templates[site][day_name] = day_templates
+                    if day_values_all:
+                        self._day_variance[site][day_name] = float(np.std(day_values_all))
+
+            log.info(
+                f"[EXTENDED-V2] Built adaptive weekly templates ({self.template_lookback_days}-day lookback, "
+                f"{int(self.adaptive_template_bias * 100)}% recency bias)"
+            )
+        except Exception as e:
+            log.error(f"[ERROR] Failed to build weekly templates: {e}")
+
+    def _fill_with_multi_week_template(self, df: pd.DataFrame, site: str, gap_start: int, gap_end: int):
+        """Fill a gap using per-(day, hour) medians from _weekly_templates."""
+        try:
+            hours = df.loc[gap_start:gap_end - 1, 'Hour'].values
+            day_names = df.loc[gap_start:gap_end - 1, 'DayOfWeek'].values
+
+            filled_vals = []
+            confidences = []
+
+            for h, day_name in zip(hours, day_names):
+                template = self._weekly_templates.get(site, {}).get(day_name, {}).get(h)
+
+                if template is not None and template.get('median') is not None:
+                    filled_vals.append(template['median'])
+                    if template['std'] > 0:
+                        confidence = 1.0 / (1.0 + template['std'] / (abs(template['median']) + 1e-6))
+                    else:
+                        confidence = 1.0
+                    confidences.append(confidence)
+                else:
+                    mask = (df['Hour'] == h) & (df[site].notna())
+                    if mask.any():
+                        filled_vals.append(df.loc[mask, site].median())
+                        confidences.append(0.5)
+                    else:
+                        filled_vals.append(np.nan)
+                        confidences.append(0.0)
+
+            filled_vals = np.array(filled_vals, dtype=float)
+            filled_vals = self._validate_and_clip(filled_vals, site, df)
+            df.loc[gap_start:gap_end - 1, site] = filled_vals
+
+            avg_confidence = float(np.nanmean(confidences)) if confidences else 0.0
+            self._reconstruction_confidence[f'{site}_{gap_start}_{gap_end}'] = avg_confidence
+
+            if avg_confidence < 0.5:
+                self._low_confidence_flags.append({
+                    'site': site,
+                    'gap_start': int(gap_start),
+                    'gap_end': int(gap_end),
+                    'gap_size': int(gap_end - gap_start),
+                    'reason': 'multi_week_template_low_confidence',
+                    'confidence': avg_confidence,
+                    'occupancy': df.loc[gap_start, 'IsOccupied'] if 'IsOccupied' in df.columns else None,
+                    'is_holiday': df.loc[gap_start, 'IsHoliday'] if 'IsHoliday' in df.columns else None,
+                })
+
+            self.strategy_log.append({
+                'site': site,
+                'gap_start': int(gap_start),
+                'gap_end': int(gap_end),
+                'gap_size': int(gap_end - gap_start),
+                'strategy': 'MULTI_WEEK_TEMPLATE',
+                'confidence': avg_confidence,
+            })
+
+        except Exception as e:
+            log.error(f"[ERROR] Multi-week template fill failed for {site}: {e}")
+            self._fill_safe_median_template(df, site, gap_start, gap_end)
+
+    # ─────────────────────────────────────────────────────────────────
+    # Occupancy + external features
+    # ─────────────────────────────────────────────────────────────────
+
+    def _add_occupancy_features(self, df: pd.DataFrame):
+        """Derive IsOccupied / OccupancyType from calendar heuristics."""
+        try:
+            df['OccupancyType'] = 'work_hours'
+            df['IsOccupied'] = True
+
+            weekend_mask = df['DayOfWeek'].isin(['Saturday', 'Sunday'])
+            df.loc[weekend_mask, 'OccupancyType'] = 'weekend'
+            df.loc[weekend_mask, 'IsOccupied'] = False
+
+            if self.calendar_data is not None:
+                holiday_list = self.calendar_data.get('holiday_list', []) if hasattr(self.calendar_data, 'get') else []
+                holiday_dates = set(pd.to_datetime(holiday_list).date) if len(holiday_list) else set()
+                is_holiday = df['Date'].isin(holiday_dates)
+            else:
+                is_holiday = df['Date'].isin(FRANCE_HOLIDAYS_2026)
+
+            df.loc[is_holiday, 'OccupancyType'] = 'holiday'
+            df.loc[is_holiday, 'IsOccupied'] = False
+
+            evening_mask = (df['Hour'] >= 18) | (df['Hour'] < 6)
+            work_hours_mask = df['OccupancyType'] == 'work_hours'
+            df.loc[evening_mask & ~weekend_mask & work_hours_mask, 'OccupancyType'] = 'evening'
+            df.loc[evening_mask & ~weekend_mask & work_hours_mask, 'IsOccupied'] = False
+
+            log.info("[EXTENDED] Added occupancy features")
+        except Exception as e:
+            log.error(f"[ERROR] Failed to add occupancy features: {e}")
+            df['IsOccupied'] = True
+            df['OccupancyType'] = 'unknown'
+
+    def _add_external_features(self, df: pd.DataFrame):
+        """Add IsHoliday / IsSpecialDay / Season / event / weather-spike flags."""
+        try:
+            df['IsHoliday'] = df['Date'].isin(FRANCE_HOLIDAYS_2026)
+            df['IsSpecialDay'] = (
+                df['Date'].isin(FRANCE_CLOSE_DAYS_2026)
+                | df['Date'].isin(FRANCE_SPECIAL_DAYS_2026)
+            )
+
+            df['IsHolidayClose'] = False
+            for holiday_date in FRANCE_HOLIDAYS_2026:
+                period_mask = (
+                    (df['Date'] >= holiday_date - timedelta(days=1))
+                    & (df['Date'] <= holiday_date + timedelta(days=1))
+                )
+                df.loc[period_mask, 'IsHolidayClose'] = True
+
+            df['IsEventDay'] = False
+            for site in self.site_cols:
+                if site in df.columns:
+                    daily_std = df.groupby('Date')[site].std()
+                    if not daily_std.empty:
+                        high_std_threshold = daily_std.quantile(0.75)
+                        high_std_dates = daily_std[daily_std > high_std_threshold].index
+                        df.loc[df['Date'].isin(high_std_dates), 'IsEventDay'] = True
+
+            df['WeatherSpike'] = False
+            if 'AirTemp' in df.columns:
+                daily_temp_change = df.groupby('Date')['AirTemp'].apply(
+                    lambda x: abs(x.max() - x.min()) if len(x) > 0 else 0
+                )
+                if not daily_temp_change.empty:
+                    temp_spike_threshold = daily_temp_change.quantile(0.80)
+                    spike_dates = daily_temp_change[daily_temp_change > temp_spike_threshold].index
+                    df.loc[df['Date'].isin(spike_dates), 'WeatherSpike'] = True
+
+            df['Season'] = df['Timestamp'].dt.month.map({
+                12: 'winter', 1: 'winter', 2: 'winter',
+                3: 'spring', 4: 'spring', 5: 'spring',
+                6: 'summer', 7: 'summer', 8: 'summer',
+                9: 'fall', 10: 'fall', 11: 'fall',
+            })
+
+            log.info("[EXTENDED-V2] Added rich external features (holiday close, event days, weather spikes)")
+        except Exception as e:
+            log.error(f"[ERROR] Failed to add external features: {e}")
+
+    # ─────────────────────────────────────────────────────────────────
+    # Uncertainty bounds + confidence
+    # ─────────────────────────────────────────────────────────────────
+
+    def _build_uncertainty_bounds(self, df: pd.DataFrame):
+        try:
+            for site in self.site_cols:
+                if site not in df.columns:
+                    continue
+
+                valid_data = df[site].dropna()
+                if len(valid_data) < 10:
+                    upper = float(valid_data.max() * 1.5) if len(valid_data) > 0 else 0.0
+                    self._uncertainty_bounds[site] = (0.0, upper)
+                    continue
+
+                mean = float(valid_data.mean())
+                std = float(valid_data.std())
+                lower_bound = max(0.0, mean - 2 * std)
+                upper_bound = mean + 2 * std
+
+                self._uncertainty_bounds[site] = (lower_bound, upper_bound)
+                log.debug(f"[UNCERTAINTY] {site}: bounds ({lower_bound:.1f}, {upper_bound:.1f})")
+
+            log.info("[EXTENDED] Built uncertainty bounds")
+        except Exception as e:
+            log.error(f"[ERROR] Failed to build uncertainty bounds: {e}")
+
+    def _calculate_confidence_with_uncertainty(
+        self,
+        site: str,
+        gap_size: int,
+        day_type: str,
+        strategy: str,
+        occupancy_type: Optional[str] = None,
+        is_holiday: bool = False,
+    ) -> float:
+        try:
+            strategy_confidence_map = {
+                'MULTI_WEEK_TEMPLATE': 0.90,
+                'MICE': 0.85,
+                'KNN_CONTEXT': 0.80,
+                'KALMAN_FILTER': 0.75,
+                'THERMAL_TEMPLATE': 0.70,
+                'ENHANCED_TEMPLATE': 0.65,
+                'WEEKEND_TEMPLATE': 0.60,
+                'PEER_CORRELATION': 0.75,
+                'LINEAR_SHORT': 0.50,
+                'LINEAR_MICRO': 0.40,
+                'SAFE_LINEAR_MEDIAN': 0.45,
+                'SAFE_MEDIAN': 0.30,
+            }
+            strategy_factor = strategy_confidence_map.get(strategy, 0.5)
+
+            if gap_size < 10:
+                gap_factor = 1.0
+            elif gap_size < 50:
+                gap_factor = 0.9
+            elif gap_size < 144:
+                gap_factor = 0.7
+            elif gap_size < 672:
+                gap_factor = 0.5
+            else:
+                gap_factor = 0.3
+
+            if occupancy_type == 'work_hours':
+                occupancy_factor = 1.0
+            elif occupancy_type == 'evening':
+                occupancy_factor = 0.8
+            elif occupancy_type == 'weekend':
+                occupancy_factor = 0.7
+            elif occupancy_type == 'holiday':
+                occupancy_factor = 0.5
+            else:
+                occupancy_factor = 0.6
+
+            holiday_factor = 0.7 if is_holiday else 1.0
+
+            confidence = strategy_factor * gap_factor * occupancy_factor * holiday_factor
+            return float(np.clip(confidence, 0.0, 1.0))
+        except Exception as e:
+            log.debug(f"[DEBUG] Confidence calculation failed: {e}")
+            return 0.5
+
+    def _flag_low_confidence(
+        self,
+        df: pd.DataFrame,
+        site: str,
+        gap_start: int,
+        gap_end: int,
+        confidence: float,
+        strategy: str,
+    ):
+        """Flag gaps with confidence < 0.5 for manual review. Takes `df`
+        explicitly so the occupancy / holiday context can be recorded."""
+        if confidence >= 0.50:
+            return
+
+        occupancy_type = None
+        is_holiday = False
+        try:
+            if 'OccupancyType' in df.columns:
+                occupancy_type = df.loc[gap_start, 'OccupancyType']
+            if 'IsHoliday' in df.columns:
+                is_holiday = bool(df.loc[gap_start, 'IsHoliday'])
+        except Exception:
+            pass
+
+        self._low_confidence_flags.append({
+            'site': site,
+            'gap_start': int(gap_start),
+            'gap_end': int(gap_end),
+            'gap_size': int(gap_end - gap_start),
+            'confidence': float(confidence),
+            'strategy': strategy,
+            'occupancy_type': occupancy_type,
+            'is_holiday': is_holiday,
+            'reason': 'low_confidence_score',
+        })
+
+    # ─────────────────────────────────────────────────────────────────
+    # Intelligent router
+    # ─────────────────────────────────────────────────────────────────
+
+    def _intelligent_router(self, df: pd.DataFrame, site: str, gap_start: int, gap_end: int):
+        """Route a gap to a fill strategy based on size, meter tier,
+        and weekend / entry context."""
+        gap_size = gap_end - gap_start
+        meter_tier = METER_HIERARCHY.get(site, {}).get('tier', 'unknown')
+        is_weekend = self._is_weekend_gap(df, gap_start, gap_end)
+        is_submeter = meter_tier == 'sub'
+        is_entry = meter_tier == 'entry'
+
+        if gap_size > 50 and not is_entry:
+            if self.use_mice and self._fill_with_mice(df, site, gap_start, gap_end):
+                return
+            if self.use_kalman and self._fill_with_kalman_filter(df, site, gap_start, gap_end):
+                return
+            if self.use_knn and self._fill_with_knn_context(df, site, gap_start, gap_end, k=5):
+                return
+
+        if is_submeter:
+            parent = METER_HIERARCHY[site]['parent']
+            if parent and parent in df.columns:
+                parent_valid = df.loc[gap_start:gap_end - 1, parent].notna().any()
+                if parent_valid:
+                    self._fill_via_peer_correlation(df, site, parent, gap_start, gap_end)
+                    self._record_router_strategy(df, site, gap_start, gap_end, gap_size, 'PEER_CORRELATION', is_weekend)
+                    return
+
+        if gap_size <= 3:
+            self._fill_linear(df, site, gap_start, gap_end)
+            strategy = 'LINEAR_MICRO'
+        elif gap_size <= 18:
+            self._fill_linear(df, site, gap_start, gap_end)
+            strategy = 'LINEAR_SHORT'
+        elif self._is_pure_weekend_gap(df, gap_start, gap_end):
+            day_type = self._get_weekend_day_type(df, gap_start, gap_end)
+            self._fill_weekend_template(df, site, gap_start, gap_end, day_type)
+            strategy = f'WEEKEND_TEMPLATE_{day_type.upper()}'
+        elif not is_entry and gap_size <= 144:
+            self._fill_with_thermal_template(df, site, gap_start, gap_end)
+            strategy = 'THERMAL_TEMPLATE'
+        elif not is_entry:
+            self._fill_enhanced_template(df, site, gap_start, gap_end)
+            strategy = 'ENHANCED_TEMPLATE'
+        else:
+            self._fill_safe_linear_median(df, site, gap_start, gap_end)
+            strategy = 'SAFE_LINEAR_MEDIAN'
+
+        self._record_router_strategy(df, site, gap_start, gap_end, gap_size, strategy, is_weekend)
+
+    def _record_router_strategy(
+        self,
+        df: pd.DataFrame,
+        site: str,
+        gap_start: int,
+        gap_end: int,
+        gap_size: int,
+        strategy: str,
+        is_weekend: bool,
+    ):
+        day_type = 'weekday'
+        if is_weekend:
+            day_type = self._get_weekend_day_type(df, gap_start, gap_end)
+
+        occupancy_type = None
+        is_holiday = False
+        try:
+            if 'OccupancyType' in df.columns:
+                occupancy_type = df.loc[gap_start, 'OccupancyType']
+            if 'IsHoliday' in df.columns:
+                is_holiday = bool(df.loc[gap_start, 'IsHoliday'])
+        except Exception:
+            pass
+
+        # Confidence map keys on the canonical strategy (strip WEEKEND_TEMPLATE_* suffix)
+        canonical_strategy = 'WEEKEND_TEMPLATE' if strategy.startswith('WEEKEND_TEMPLATE') else strategy
+        confidence = self._calculate_confidence_with_uncertainty(
+            site, gap_size, day_type, canonical_strategy, occupancy_type, is_holiday
+        )
+
+        self._reconstruction_confidence[f'{site}_{gap_start}_{gap_end}'] = confidence
+        self._flag_low_confidence(df, site, gap_start, gap_end, confidence, strategy)
+
+        self.strategy_log.append({
+            'site': site,
+            'gap_start': int(gap_start),
+            'gap_end': int(gap_end),
+            'gap_size': int(gap_size),
+            'strategy': strategy,
+            'confidence': float(confidence),
+            'day_type': day_type,
+            'occupancy_type': occupancy_type,
+            'is_holiday': is_holiday,
+        })
+
+    # ─────────────────────────────────────────────────────────────────
+    # Fill strategies
+    # ─────────────────────────────────────────────────────────────────
+
+    def _fill_linear(self, df: pd.DataFrame, site: str, gap_start: int, gap_end: int):
+        try:
+            left_val = df.loc[gap_start - 1, site] if gap_start > 0 else np.nan
+            right_val = df.loc[gap_end, site] if gap_end < len(df) else np.nan
+
+            if np.isnan(left_val) or np.isnan(right_val):
+                self._fill_safe_median_template(df, site, gap_start, gap_end)
+                return
+
+            filled = np.linspace(left_val, right_val, gap_end - gap_start + 2)[1:-1]
+            df.loc[gap_start:gap_end - 1, site] = filled
+        except Exception as e:
+            log.error(f"[ERROR] Linear fill failed for {site}: {e}")
+            self._fill_safe_median_template(df, site, gap_start, gap_end)
+
+    def _fill_weekend_template(self, df: pd.DataFrame, site: str, gap_start: int, gap_end: int, day_type: str):
+        try:
+            template = self.templates.get(day_type.lower(), {}).get(site, {})
+            if not template:
+                self._fill_safe_median_template(df, site, gap_start, gap_end)
+                return
+
+            hours = df.loc[gap_start:gap_end - 1, 'Hour'].values
+            filled_vals = np.array([template.get(h, np.nan) for h in hours], dtype=float)
+            filled_vals = self._validate_and_clip(filled_vals, site, df)
+            df.loc[gap_start:gap_end - 1, site] = filled_vals
+        except Exception as e:
+            log.error(f"[ERROR] Weekend template fill failed: {e}")
+            self._fill_safe_median_template(df, site, gap_start, gap_end)
+
+    def _fill_with_thermal_template(self, df: pd.DataFrame, site: str, gap_start: int, gap_end: int):
+        try:
+            hours = df.loc[gap_start:gap_end - 1, 'Hour'].values
+            template_vals = []
+            for h in hours:
+                hist_mask = (df['Hour'] == h) & (df[site].notna())
+                if hist_mask.any():
+                    template_vals.append(df.loc[hist_mask, site].median())
+                else:
+                    template_vals.append(np.nan)
+
+            filled_vals = np.array(template_vals, dtype=float)
+            filled_vals = self._validate_and_clip(filled_vals, site, df)
+            df.loc[gap_start:gap_end - 1, site] = filled_vals
+        except Exception as e:
+            log.error(f"[ERROR] Thermal template failed: {e}")
+            self._fill_safe_median_template(df, site, gap_start, gap_end)
+
+    def _fill_enhanced_template(self, df: pd.DataFrame, site: str, gap_start: int, gap_end: int):
+        self._fill_with_thermal_template(df, site, gap_start, gap_end)
+
+    def _fill_safe_linear_median(self, df: pd.DataFrame, site: str, gap_start: int, gap_end: int):
+        try:
+            left_val = df.loc[gap_start - 1, site] if gap_start > 0 else np.nan
+            right_val = df.loc[gap_end, site] if gap_end < len(df) else np.nan
+
+            if np.isnan(left_val) or np.isnan(right_val):
+                self._fill_safe_median_template(df, site, gap_start, gap_end)
+                return
+
+            filled = np.linspace(left_val, right_val, gap_end - gap_start + 2)[1:-1]
+            valid_vals = df[site].dropna()
+            if len(valid_vals) > 0:
+                median_val = valid_vals.median()
+                filled = filled * 0.9 + median_val * 0.1
+
+            df.loc[gap_start:gap_end - 1, site] = filled
+        except Exception as e:
+            log.error(f"[ERROR] Safe linear-median failed: {e}")
+            self._fill_safe_median_template(df, site, gap_start, gap_end)
+
+    def _fill_safe_median_template(self, df: pd.DataFrame, site: str, gap_start: int, gap_end: int):
+        try:
+            valid_vals = df[site].dropna()
+            if len(valid_vals) > 0:
+                df.loc[gap_start:gap_end - 1, site] = valid_vals.median()
+            else:
+                df.loc[gap_start:gap_end - 1, site] = 0.0
+        except Exception as e:
+            log.error(f"[ERROR] Safe median failed: {e}")
+            df.loc[gap_start:gap_end - 1, site] = 0.0
+
+    def _fill_via_peer_correlation(self, df: pd.DataFrame, child: str, parent: str, gap_start: int, gap_end: int):
+        try:
+            ratio = self._peer_ratios.get(child, 0.5)
+            parent_values = df.loc[gap_start:gap_end - 1, parent].values.astype(float)
+            filled_vals = parent_values * ratio
+            filled_vals = self._validate_and_clip(filled_vals, child, df)
+            df.loc[gap_start:gap_end - 1, child] = filled_vals
+        except Exception as e:
+            log.error(f"[ERROR] Peer correlation failed: {e}")
+            self._fill_safe_median_template(df, child, gap_start, gap_end)
+
+    # ─────────────────────────────────────────────────────────────────
+    # ML stubs (disabled by default; kept as placeholders for future work)
+    # ─────────────────────────────────────────────────────────────────
+
+    def _fill_with_mice(self, df: pd.DataFrame, site: str, gap_start: int, gap_end: int, iterations: int = 3):
+        return False
+
+    def _fill_with_kalman_filter(self, df: pd.DataFrame, site: str, gap_start: int, gap_end: int):
+        return False
+
+    def _fill_with_knn_context(self, df: pd.DataFrame, site: str, gap_start: int, gap_end: int, k: int = 5):
+        return False
+
+    # ─────────────────────────────────────────────────────────────────
+    # Validation + smoothing + final NaN guard
+    # ─────────────────────────────────────────────────────────────────
+
+    def _validate_and_clip(self, values: np.ndarray, site: str, df: pd.DataFrame) -> np.ndarray:
+        values = np.array(values, dtype=float)
+        nan_mask = np.isnan(values)
+        if np.any(nan_mask):
+            valid_historical = df[site].dropna()
+            if len(valid_historical) > 0:
+                values[nan_mask] = float(valid_historical.median())
+            else:
+                values[nan_mask] = 0.0
+
+        valid_historical = df[site].dropna()
+        if len(valid_historical) > 0:
+            peak = float(valid_historical.max())
+            values = np.clip(values, 0.0, peak * 1.5)
+
+        return values
+
+    def _nan_guard_final_pass(self, df: pd.DataFrame):
+        for site in self.site_cols:
+            if site not in df.columns:
+                continue
+
+            nan_mask = df[site].isna()
+            if not nan_mask.any():
+                continue
+
+            for gap_start, gap_end in self._find_gap_groups(nan_mask):
+                self._fill_safe_median_template(df, site, gap_start, gap_end)
+                self.strategy_log.append({
+                    'site': site,
+                    'gap_start': int(gap_start),
+                    'gap_end': int(gap_end),
+                    'gap_size': int(gap_end - gap_start),
+                    'strategy': 'SAFE_MEDIAN',
+                    'confidence': 0.30,
+                })
+
+    def _smooth_junctions(self, df: pd.DataFrame, site: str):
+        """Light Savitzky-Golay smoothing around any remaining NaN boundaries."""
+        try:
+            gap_mask = df[site].isna()
+            if not gap_mask.any():
+                return
+
+            for gap_start, gap_end in self._find_gap_groups(gap_mask):
+                window_size = 21
+                lo = gap_start - window_size // 2
+                hi = gap_start + window_size // 2
+                if lo < 0 or hi >= len(df):
+                    continue
+                window = df.loc[lo:hi, site].values
+                if np.all(np.isnan(window)):
+                    continue
+                window_filled = pd.Series(window).ffill().bfill().values
+                try:
+                    smoothed = savgol_filter(window_filled, window_size, 3)
+                    valid_mask = ~pd.isna(df.loc[lo:hi, site].values)
+                    df.loc[lo:hi, site] = np.where(valid_mask, smoothed, df.loc[lo:hi, site].values)
+                except Exception:
+                    pass
+        except Exception as e:
+            log.debug(f"[DEBUG] Smoothing failed: {e}")
+
+    # ─────────────────────────────────────────────────────────────────
+    # Helper pipeline steps
+    # ─────────────────────────────────────────────────────────────────
+
+    def _add_datetime_features(self, df: pd.DataFrame):
+        df['Hour'] = df['Timestamp'].dt.hour
+        df['DayOfWeek'] = df['Timestamp'].dt.day_name()
+        df['Date'] = df['Timestamp'].dt.date
+
+    def _fill_airtemp_forward(self, df: pd.DataFrame):
+        if 'AirTemp' in df.columns:
+            df['AirTemp'] = df['AirTemp'].ffill().bfill()
+
+    def _merge_weather(self, df: pd.DataFrame) -> pd.DataFrame:
+        if self.weather_df is None:
+            return df
+
+        weather = self.weather_df.copy()
+        col = 'Timestamp' if 'Timestamp' in weather.columns else 'Date'
+        weather['Timestamp'] = pd.to_datetime(weather[col])
+        df = df.merge(weather[['Timestamp', 'AirTemp']], on='Timestamp', how='left')
+        if 'AirTemp' in df.columns:
+            df['AirTemp'] = df['AirTemp'].ffill().bfill()
+        return df
+
+    def _classify_thermal_regimes(self, df: pd.DataFrame):
+        if 'AirTemp' not in df.columns:
+            df['ThermalRegime'] = 'Mild'
+        else:
+            df['ThermalRegime'] = pd.cut(
+                df['AirTemp'],
+                bins=[-np.inf, 10, 20, np.inf],
+                labels=['Cold', 'Mild', 'Hot'],
+            )
+
+    def _build_day_specific_templates(self, df: pd.DataFrame):
+        self.templates['saturday'] = {}
+        self.templates['sunday'] = {}
+
+        for site in self.site_cols:
+            if site not in df.columns:
+                continue
+
+            sat_mask = (df['DayOfWeek'] == 'Saturday') & (df[site].notna())
+            if sat_mask.any():
+                self.templates['saturday'][site] = (
+                    df.loc[sat_mask].groupby('Hour')[site].median().to_dict()
+                )
+
+            sun_mask = (df['DayOfWeek'] == 'Sunday') & (df[site].notna())
+            if sun_mask.any():
+                self.templates['sunday'][site] = (
+                    df.loc[sun_mask].groupby('Hour')[site].median().to_dict()
+                )
+
+    def _build_seasonal_templates(self, df: pd.DataFrame):
+        try:
+            for site in self.site_cols:
+                if site not in df.columns:
+                    continue
+                self._seasonal_templates[site] = {}
+        except Exception as e:
+            log.debug(f"[DEBUG] Seasonal templates failed: {e}")
+
+    def _build_peer_ratios(self, df: pd.DataFrame):
+        for site, info in METER_HIERARCHY.items():
+            if info['tier'] != 'sub':
+                continue
+
+            parent = info['parent']
+            if parent is None or parent not in df.columns or site not in df.columns:
+                continue
+
+            last_24h_mask = (df[site].notna()) & (df[parent].notna())
+            if last_24h_mask.any():
+                n_valid = int(last_24h_mask.sum())
+                last_indices = np.where(last_24h_mask.values)[0][-min(144, n_valid):]
+                child_vals = df.loc[last_indices, site].values.astype(float)
+                parent_vals = df.loc[last_indices, parent].values.astype(float)
+
+                parent_nonzero = parent_vals > 1
+                if parent_nonzero.any():
+                    ratios = child_vals[parent_nonzero] / parent_vals[parent_nonzero]
+                    ratios = ratios[~np.isnan(ratios)]
+                    self._peer_ratios[site] = float(np.median(ratios)) if len(ratios) else 0.5
+                else:
+                    self._peer_ratios[site] = 0.5
+            else:
+                self._peer_ratios[site] = 0.5
+
+    def _build_multi_site_correlations(self, df: pd.DataFrame):
+        try:
+            for site1 in self.site_cols:
+                if site1 not in df.columns:
+                    continue
+                self._multi_site_correlations[site1] = {}
+
+                for site2 in self.site_cols:
+                    if site2 == site1 or site2 not in df.columns:
+                        continue
+
+                    valid_mask = df[site1].notna() & df[site2].notna()
+                    if valid_mask.sum() > 10:
+                        corr = df.loc[valid_mask, [site1, site2]].corr().iloc[0, 1]
+                        self._multi_site_correlations[site1][site2] = (
+                            float(corr) if not np.isnan(corr) else 0.0
+                        )
+        except Exception as e:
+            log.debug(f"[DEBUG] Multi-site correlation failed: {e}")
+
+    # ─────────────────────────────────────────────────────────────────
+    # Gap utilities
+    # ─────────────────────────────────────────────────────────────────
+
+    def _is_weekend_gap(self, df: pd.DataFrame, gap_start: int, gap_end: int) -> bool:
+        dow_values = df.loc[gap_start:gap_end - 1, 'DayOfWeek'].unique()
+        return any(d in ('Saturday', 'Sunday') for d in dow_values)
+
+    def _is_pure_weekend_gap(self, df: pd.DataFrame, gap_start: int, gap_end: int) -> bool:
+        dow_values = df.loc[gap_start:gap_end - 1, 'DayOfWeek'].unique()
+        all_days = set(dow_values)
+        weekdays = {'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'}
+        return all_days.isdisjoint(weekdays)
+
+    def _get_weekend_day_type(self, df: pd.DataFrame, gap_start: int, gap_end: int) -> str:
+        dow_values = df.loc[gap_start:gap_end - 1, 'DayOfWeek'].unique()
+        has_sat = 'Saturday' in dow_values
+        has_sun = 'Sunday' in dow_values
+
+        if has_sat and has_sun:
+            return 'mixed'
+        if has_sat:
+            return 'saturday'
+        if has_sun:
+            return 'sunday'
+        return 'mixed'
+
+    def _find_gap_groups(self, mask: pd.Series) -> List[Tuple[int, int]]:
+        indices = np.where(mask.values)[0] if hasattr(mask, 'values') else np.where(mask)[0]
+        if len(indices) == 0:
+            return []
+
+        gaps = []
+        start = int(indices[0])
+
+        for i in range(1, len(indices)):
+            if indices[i] - indices[i - 1] > 1:
+                gaps.append((start, int(indices[i - 1]) + 1))
+                start = int(indices[i])
+
+        gaps.append((start, int(indices[-1]) + 1))
+        return gaps
+
+    # ─────────────────────────────────────────────────────────────────
+    # Reports
+    # ─────────────────────────────────────────────────────────────────
+
+    def get_low_confidence_report(self) -> pd.DataFrame:
+        if not self._low_confidence_flags:
+            return pd.DataFrame()
+        return pd.DataFrame(self._low_confidence_flags)
+
+    def get_strategy_log(self) -> pd.DataFrame:
+        if not self.strategy_log:
+            return pd.DataFrame()
+        return pd.DataFrame(self.strategy_log)
+
+    # ─────────────────────────────────────────────────────────────────
+    # Legacy compatibility shims (kept so external callers relying on the
+    # old TemperatureAwareHybridEngine surface do not break)
+    # ─────────────────────────────────────────────────────────────────
+
     def get_strategy_summary(self) -> pd.DataFrame:
-        """Return routing decisions used for each filled gap."""
-        return pd.DataFrame(self.strategy_log) if self.strategy_log else pd.DataFrame()
+        """Legacy alias. Returns strategy_log as a DataFrame."""
+        return self.get_strategy_log()
 
     def get_sensor_health(self) -> Dict[str, float]:
-        """Health score per sensor (0–100)."""
-        health = {}
-        for site in self.site_cols:
-            score = 100.0
-            if site in self.anomaly_scores:
-                scores = self.anomaly_scores[site]
-                vals = list(scores.values()) if isinstance(scores, dict) else list(scores)
-                anom = sum(1 for s in vals if s < -0.5)
-                if vals:
-                    score -= (anom / len(vals)) * 30
-            if site in self.peer_correlations:
-                corrs = list(self.peer_correlations[site].values())
-                if corrs and np.mean(corrs) < 0.5:
-                    score -= 15
-            health[site] = max(0.0, score)
-        return health
+        """Legacy shim, returns a flat 100.0 score per configured site.
+        The new algorithm does not compute per-sensor health scores."""
+        return {site: 100.0 for site in self.site_cols}
 
     def integrate_weather_forecast(
         self,
@@ -156,1315 +1157,36 @@ class TemperatureAwareHybridEngine:
         end_idx: int,
         temp_forecast: np.ndarray,
     ):
-        """Enhance already-imputed gap using weather forecast data."""
-        templates = self._templates or {}
-        for i, idx in enumerate(range(start_idx, min(end_idx, len(df)))):
-            if i >= len(temp_forecast):
-                break
-            temp = temp_forecast[i]
-            ts = df.loc[idx, 'Timestamp']
-            regime, season, day_type = self._classify_conditions(ts, temp)
-            hour_min = f"{ts.hour:02d}:{ts.minute:02d}"
-            template_val = self._get_template_value(site, regime, season, day_type, hour_min)
-            if pd.notna(template_val):
-                temp_anomaly = (temp - 15) / 10
-                adjusted = template_val * (1 + 0.1 * temp_anomaly)
-                current = df.loc[idx, site]
-                df.loc[idx, site] = 0.7 * current + 0.3 * adjusted if pd.notna(current) else adjusted
+        """Legacy shim, no-op. Forecast-aware enhancement is not implemented
+        in this algorithm."""
+        log.debug("[LEGACY] integrate_weather_forecast called; no-op in the new engine")
+        return
 
     def cache_templates(self, fingerprint: str = ''):
-        """Save current templates + rolling stats to disk."""
-        if self._templates:
-            try:
-                payload = {'templates': self._templates, 'rolling': self._rolling, 'fingerprint': fingerprint}
-                with open(self._template_cache_file, 'wb') as f:
-                    pickle.dump(payload, f)
-                print(f"[OK] Templates cached ({self._template_cache_file})")
-            except Exception as e:
-                print(f"[WARN] Cache write failed: {e}")
+        """Legacy shim, best-effort pickle of the weekly templates."""
+        if not self._weekly_templates:
+            return
+        try:
+            payload = {
+                'weekly_templates': self._weekly_templates,
+                'day_variance': self._day_variance,
+                'fingerprint': fingerprint,
+            }
+            os.makedirs(os.path.dirname(self.template_cache_file) or '.', exist_ok=True)
+            with open(self.template_cache_file, 'wb') as f:
+                pickle.dump(payload, f)
+            log.debug(f"[LEGACY] Templates cached to {self.template_cache_file}")
+        except Exception as e:
+            log.debug(f"[LEGACY] cache_templates write failed: {e}")
 
     def benchmark(
         self,
         df: pd.DataFrame,
         site: str = 'Ptot_HA',
-        gap_lengths: List[int] = None,
+        gap_lengths: Optional[List[int]] = None,
         n_runs: int = 20,
         random_state: int = 42,
     ) -> pd.DataFrame:
-        """Benchmark hybrid imputation vs simple linear baseline.
-
-        PERF #9: all fixed-cost operations (template build, anomaly detection,
-        peer correlations, bounds) are computed ONCE before the run loop instead
-        of being repeated inside every impute() call.  A lightweight
-        _impute_gap_only() path then fills only the injected gap, skipping the
-        full pipeline overhead (grid reindex, weather merge, etc.).
-        """
-        if gap_lengths is None:
-            gap_lengths = [6, 24, 72]
-        if site not in df.columns:
-            raise ValueError(f"Site '{site}' not found in dataframe")
-
-        df = df.copy().sort_values('Timestamp').reset_index(drop=True)
-        df['Timestamp'] = pd.to_datetime(df['Timestamp'])
-
-        print("[BENCH] Precomputing fixed-cost operations…", flush=True)
-        if self.weather_df is not None:
-            df = self._merge_weather(df)
-        self._fill_airtemp(df)
-        precomp_bounds = self._precompute_all(df)
-        print("[BENCH] Precomputation done, starting runs.", flush=True)
-
-        rng = np.random.default_rng(random_state)
-
-        def _mae(a, b):  return float(np.mean(np.abs(a - b)))
-        def _rmse(a, b): return float(np.sqrt(np.mean((a - b) ** 2)))
-
-        records = []
-        valid_mask = df[site].notna().values
-        n = len(df)
-
-        for gap_len in gap_lengths:
-            if gap_len <= 0 or gap_len + 2 > n:
-                continue
-            for run in range(n_runs):
-                start_idx, tries = None, 0
-                while tries < 50 and start_idx is None:
-                    candidate = int(rng.integers(1, n - gap_len - 1))
-                    end_idx = candidate + gap_len
-                    if valid_mask[candidate - 1: end_idx + 1].all():
-                        start_idx = candidate
-                    tries += 1
-                if start_idx is None:
-                    continue
-
-                end_idx = start_idx + gap_len
-                y_true = df.loc[start_idx:end_idx - 1, site].to_numpy(dtype=float)
-
-                df_gap_hybrid = df.copy()
-                df_gap_hybrid.loc[start_idx:end_idx - 1, site] = np.nan
-                self._impute_gap_only(df_gap_hybrid, site, start_idx, end_idx, precomp_bounds)
-                y_hybrid = df_gap_hybrid.loc[start_idx:end_idx - 1, site].to_numpy(dtype=float)
-
-                df_gap_baseline = df.copy()
-                df_gap_baseline.loc[start_idx:end_idx - 1, site] = np.nan
-                df_gap_baseline[site] = df_gap_baseline[site].interpolate(method='linear')
-                y_baseline = df_gap_baseline.loc[start_idx:end_idx - 1, site].to_numpy(dtype=float)
-
-                for strategy, y_pred in [('hybrid', y_hybrid), ('baseline_linear', y_baseline)]:
-                    records.append({
-                        'site': site, 'gap_length': gap_len, 'run': run,
-                        'strategy': strategy,
-                        'mae':  _mae(y_true, y_pred),
-                        'rmse': _rmse(y_true, y_pred),
-                    })
-
-        return pd.DataFrame.from_records(records)
-
-    def _impute_gap_only(
-        self,
-        df: pd.DataFrame,
-        site: str,
-        start_idx: int,
-        end_idx: int,
-        bounds: Dict[str, Tuple[float, float]],
-    ):
-        """Lightweight gap-fill used by benchmark(), skips full pipeline overhead.
-
-        Assumes templates, anomaly scores, and peer correlations are already
-        populated on self (done once by benchmark before the run loop).
-        """
-        self._route_gap_7layer(df, site, start_idx, end_idx, log_strategy=False)
-
-        if site in bounds:
-            df.loc[start_idx:end_idx - 1, site] = df.loc[start_idx:end_idx - 1, site].clip(*bounds[site])
-
-    def _load_expanded_historical_data(self) -> Optional[pd.DataFrame]:
-        """Load all available historical data (2021-2025) with unified column mapping and AirTemp."""
-        dfs = []
-        col_map = {
-            'HA': 'Ptot_HA',
-            'HEI1': 'Ptot_HEI',
-            'HEI2': 'Ptot_HEI_13RT',
-            'RIZOMM': 'Ptot_RIZOMM',
-            'Campus': 'Ptot_Ilot',
-            'AirTemp': 'AirTemp',
-        }
-        out_cols = ['Timestamp', 'Ptot_HA', 'Ptot_HEI', 'Ptot_HEI_13RT', 'Ptot_HEI_5RNS', 'Ptot_RIZOMM', 'Ptot_Ilot', 'AirTemp']
-
-        def _load_year(path: str, label: str, add_5rns_nan: bool, force_airtemp_nan: bool = False):
-            try:
-                df = pd.read_csv(path)
-                df['Date'] = pd.to_datetime(df['Date'])
-                df = df.rename(columns=col_map)
-                df['Timestamp'] = df['Date']
-                if add_5rns_nan:
-                    df['Ptot_HEI_5RNS'] = np.nan
-                if force_airtemp_nan:
-                    df['AirTemp'] = np.nan
-                dfs.append(df[out_cols])
-                print(f"[OK] Loaded {label}: {len(df):,} records")
-            except Exception as e:
-                print(f"[WARN] {label} data load failed: {e}")
-
-        _load_year('data/Consumption_2021_Power.csv', '2021', add_5rns_nan=True)
-        _load_year('data/Consumption_2022_Power.csv', '2022', add_5rns_nan=True)
-        _load_year('data/2023 -2025.csv', '2023-2025', add_5rns_nan=False, force_airtemp_nan=True)
-        
-        if not dfs:
-            print("[ERROR] No historical data loaded")
-            return None
-        
-        # Merge all dataframes
-        combined = pd.concat(dfs, ignore_index=True)
-        combined = combined.sort_values('Timestamp').reset_index(drop=True)
-        
-        self._fill_airtemp(combined)
-        
-        date_range = f"{combined['Timestamp'].min()} to {combined['Timestamp'].max()}"
-        print(f"[OK] Combined historical data: {len(combined):,} total records ({date_range})")
-        return combined
-
-    def _linear_interp_weights(self, gap_size: int) -> np.ndarray:
-        """Helper: compute linear interpolation weights (REDUNDANCY #5).
-        
-        Returns normalized weights from 0 to 1 for gap of size gap_size.
-        """
-        return np.arange(1, gap_size + 1) / (gap_size + 1)
-
-    def _get_template_value(self, site: str, regime: str, season: str, day_type: str, hour_min: str) -> float:
-        """Consolidate nested template dictionary access with 4-D key.
-        
-        Key structure: templates[site][regime][season][day_type][hour_min]
-        Returns np.nan if key not found.
-        """
-        templates = self._templates or {}
-        return templates.get(site, {}).get(regime, {}).get(season, {}).get(day_type, {}).get(hour_min, np.nan)
-
-    def _fill_airtemp(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Helper: consolidate AirTemp forward-fill logic (REDUNDANCY #1)."""
-        if 'AirTemp' in df.columns:
-            df['AirTemp'] = df['AirTemp'].ffill().bfill()
-        return df
-
-    def _precompute_all(self, df: pd.DataFrame) -> Dict[str, Tuple[float, float]]:
-        """Helper: consolidate precomputation sequence (REDUNDANCY #2).
-        
-        Used by both impute() and benchmark() paths.
-        Returns bounds dict for final clipping.
-        """
-        self._build_templates_if_needed(df)
-        self._detect_anomalies(df)
-        self._calculate_peer_correlations(df)
-        return self._calculate_bounds(df)
-
-    def _load_cached_templates(self):
-        if os.path.exists(self._template_cache_file):
-            try:
-                with open(self._template_cache_file, 'rb') as f:
-                    payload = pickle.load(f)
-                self._templates = payload.get('templates')
-                self._rolling = payload.get('rolling')
-                self._cache_fingerprint = payload.get('fingerprint', '')
-                print(f"[OK] Loaded cached templates")
-            except Exception as e:
-                print(f"[WARN] Failed to load template cache: {e}")
-
-    def _data_fingerprint(self, df: pd.DataFrame) -> str:
-        """Hash of (shape, date range, columns) to detect stale cache."""
-        key = f"{df.shape}_{df['Timestamp'].min()}_{df['Timestamp'].max()}_{sorted(df.columns.tolist())}"
-        return hashlib.md5(key.encode()).hexdigest()[:12]
-
-    def _merge_weather(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Merge weather data (AirTemp) from external source.
-        
-        If weather_df is provided, merge it. Otherwise, try to load from file.
-        Forward-fill to handle any remaining NaN values.
-        """
-        if self.weather_df is None:
-            # Try to load weather data from file
-            try:
-                self.weather_df = pd.read_csv('data/2026 weather data.csv')
-                print(f"[OK] Loaded weather data: {len(self.weather_df):,} records")
-            except Exception:
-                print("[WARN] No weather data file found, proceeding without external temperature")
-                return df
-        
-        weather = self.weather_df.copy()
-        col = 'Date' if 'Date' in weather.columns else 'Timestamp'
-        weather['Timestamp'] = pd.to_datetime(weather[col])
-        
-        # Merge and fill AirTemp gaps
-        result = df.merge(weather[['Timestamp', 'AirTemp']], on='Timestamp', how='left')
-        
-        # Forward-fill missing AirTemp values
-        self._fill_airtemp(result)
-        
-        return result
-
-    def _classify_day_type(self, ts: pd.Timestamp) -> str:
-        """Classify day into 7 categories based on calendar."""
-        d = ts.date()
-        if d in self.close_days:
-            return 'close'          # Site-specific closures (near-zero load)
-        if d in self.holidays:
-            return 'holiday'        # Bank holidays (reduced load)
-        if d in self.special_days:
-            return 'special'        # Bridges, academic calendar, etc.
-        weekday = ts.weekday()
-        if weekday == 4:
-            return 'friday'         # Friday (often transition day)
-        if weekday == 5:
-            return 'saturday'       # Saturday (bell-curve pattern, higher load)
-        if weekday == 6:
-            return 'sunday'         # Sunday (flat pattern, lower load)
-        return 'weekday'            # Monday-Thursday
-
-    def _classify_season(self, ts: pd.Timestamp) -> str:
-        """Classify season based on month."""
-        m = ts.month
-        if m in (12, 1, 2):
-            return 'winter'
-        if m in (3, 4, 5):
-            return 'spring'
-        if m in (6, 7, 8):
-            return 'summer'
-        return 'autumn'  # (9, 10, 11)
-
-    def _classify_conditions(self, ts: pd.Timestamp, temp: float) -> Tuple[str, str, str]:
-        """Classify temperature regime, season, and day type.
-        
-        Returns: (regime, season, day_type)
-        - regime: 'cold' (<5°C), 'mild', 'hot' (>20°C)
-        - season: 'winter', 'spring', 'summer', 'autumn'
-        - day_type: 'weekday', 'friday', 'saturday', 'sunday', 'holiday', 'close', 'special'
-        """
-        # Temperature regime
-        if not np.isnan(temp):
-            regime = 'cold' if temp < 5 else ('hot' if temp > 20 else 'mild')
-        else:
-            regime = 'mild'
-        
-        # Season and day type
-        season = self._classify_season(ts)
-        day_type = self._classify_day_type(ts)
-        
-        return regime, season, day_type
-
-    def _fallback_template(self, site: str, regime: str, season: str, day_type: str) -> Dict:
-        """Graceful fallback for rare (regime, season, day_type) combinations.
-        
-        Fallback hierarchy:
-        1. Exact (regime, season, day_type)
-        2. Same regime, any season
-        3. 'mild' regime, any season
-        4. Generic weekday fallback
-        """
-        t = self._templates.get(site, {})
-        
-        # Try exact match
-        v = t.get(regime, {}).get(season, {}).get(day_type)
-        if v:
-            return v
-        
-        # Try same regime, any season
-        for seas in ['winter', 'spring', 'summer', 'autumn']:
-            v = t.get(regime, {}).get(seas, {}).get(day_type)
-            if v:
-                return v
-        
-        # Try 'mild' regime, any season
-        for seas in ['winter', 'spring', 'summer', 'autumn']:
-            v = t.get('mild', {}).get(seas, {}).get(day_type)
-            if v:
-                return v
-        
-        # Last resort: mild, winter, weekday
-        return t.get('mild', {}).get('winter', {}).get('weekday', {})
-
-    def _find_gap_groups(self, mask: pd.Series) -> List[Tuple[int, int]]:
-        gaps = np.where(mask.values)[0]
-        if len(gaps) == 0:
-            return []
-        
-        breaks = np.where(np.diff(gaps) > 1)[0] + 1
-        groups = []
-        prev = 0
-        
-        for break_idx in breaks:
-            groups.append((int(gaps[prev]), int(gaps[break_idx - 1]) + 1))
-            prev = break_idx
-        
-        groups.append((int(gaps[prev]), int(gaps[-1]) + 1))
-        return groups
-
-    def _fill_linear_with_temp(self, df: pd.DataFrame, site: str, start_idx: int, end_idx: int):
-        if start_idx > 0 and end_idx < len(df):
-            before = df.loc[start_idx - 1, site]
-            after = df.loc[end_idx, site]
-            if pd.isna(before) or pd.isna(after):
-                return
-            gap_size = end_idx - start_idx
-            t = self._linear_interp_weights(gap_size)
-            df.loc[start_idx:end_idx - 1, site] = before + t * (after - before)
-
-    def _fill_pilotage_temp_aware(self, df: pd.DataFrame, site: str, start_idx: int, end_idx: int, gap_size: int):
-        self._build_templates_if_needed(df)
-
-        if gap_size in [60, 72] and start_idx > 72 and end_idx < len(df) - 72:
-            before = df.loc[max(0, start_idx - 72):start_idx - 1, site].dropna()
-            after = df.loc[end_idx:min(len(df) - 1, end_idx + 72), site].dropna()
-            if len(before) > 0 and len(after) > 0:
-                cv = ((before.std() / (before.mean() + 1e-6)) + (after.std() / (after.mean() + 1e-6))) / 2
-                if cv < 0.15:
-                    bv, av = df.loc[start_idx - 1, site], df.loc[end_idx, site]
-                    if not pd.isna(bv) and not pd.isna(av):
-                            t = self._linear_interp_weights(gap_size)
-                            df.loc[start_idx:start_idx + gap_size - 1, site] = bv + t * (av - bv)
-                            return
-
-        if gap_size > 72:
-            self._fill_long_gap(df, site, start_idx, end_idx, gap_size)
-        else:
-            self._fill_pilotage_standard(df, site, start_idx, end_idx, gap_size)
-
-    def _fill_long_gap(self, df: pd.DataFrame, site: str, start_idx: int, end_idx: int, gap_size: int):
-        self._fill_ensemble(df, site, start_idx, end_idx, gap_size)
-        norm_info = self._normalize_long_gap_amplitude(df, site, start_idx, end_idx)
-        self._apply_adaptive_smoothing(df, site, start_idx, end_idx)
-        align_info = self._align_to_edge_levels(df, site, start_idx, end_idx)
-        self._last_postproc = {'norm': norm_info, 'align': align_info}
-
-    def _route_gap_7layer(self, df: pd.DataFrame, site: str, start_idx: int, end_idx: int, log_strategy: bool = True):
-        """Explicit 7-layer pilotage router.
-
-        Layers use progressively heavier methods as gap duration grows.
-        """
-        gap_size = end_idx - start_idx
-        strategy = 'UNKNOWN'
-        confidence = 0.5
-
-        if gap_size <= 3:
-            self._fill_linear_with_temp(df, site, start_idx, end_idx)
-            strategy, confidence = 'L1_LINEAR_MICRO', 0.98
-
-        elif gap_size <= 18:
-            self._fill_linear_with_temp(df, site, start_idx, end_idx)
-            strategy, confidence = 'L2_LINEAR_TEMP', 0.95
-
-        elif gap_size <= 24:
-            if self._try_spline_fill(df, site, start_idx, end_idx):
-                strategy, confidence = 'L3_SPLINE', 0.92
-            else:
-                self._fill_pilotage_standard(df, site, start_idx, end_idx, gap_size)
-                strategy, confidence = 'L3_PILOTAGE_FALLBACK', 0.86
-
-        elif gap_size <= 72:
-            if self._anomaly_near_gap(site, start_idx, end_idx):
-                self._fill_pilotage_standard(df, site, start_idx, end_idx, gap_size)
-                strategy, confidence = 'L4_ANOMALY_GUARDED', 0.82
-            else:
-                self._fill_pilotage_temp_aware(df, site, start_idx, end_idx, gap_size)
-                strategy, confidence = 'L4_TEMP_AWARE', 0.88
-
-        elif gap_size <= 144:
-            self._fill_pilotage_temp_aware(df, site, start_idx, end_idx, gap_size)
-            strategy, confidence = 'L5_DAY_SCALE_PILOTAGE', 0.8
-
-        elif gap_size <= 432:
-            self._fill_long_gap(df, site, start_idx, end_idx, gap_size)
-            strategy, confidence = 'L6_MULTI_DAY_ENSEMBLE', 0.72
-
-        else:
-            self._fill_long_gap(df, site, start_idx, end_idx, gap_size)
-            strategy, confidence = 'L7_VERY_LONG_ENSEMBLE', 0.65
-
-        fallback_strategy = self._validate_and_fallback_recovery(df, site, start_idx, end_idx, strategy)
-        if fallback_strategy != strategy:
-            strategy = fallback_strategy
-            confidence *= 0.8
-
-        if log_strategy:
-            entry = {
-                'site': site,
-                'gap_start': int(start_idx),
-                'gap_end': int(end_idx),
-                'gap_size': int(gap_size),
-                'strategy': strategy,
-                'confidence': float(confidence),
-            }
-            pp = getattr(self, '_last_postproc', None)
-            if pp is not None:
-                entry['postproc'] = pp
-                self._last_postproc = None
-            self.strategy_log.append(entry)
-
-    def _try_spline_fill(self, df: pd.DataFrame, site: str, start_idx: int, end_idx: int) -> bool:
-        vals = self._method_spline(df, site, start_idx, end_idx)
-        if len(vals) == 0 or np.all(np.isnan(vals)):
-            return False
-        if np.isnan(vals).any():
-            good = np.where(~np.isnan(vals))[0]
-            if len(good) == 0:
-                return False
-            vals = np.interp(np.arange(len(vals)), good, vals[good])
-        df.loc[start_idx:end_idx - 1, site] = vals
-        return True
-
-    def _anomaly_near_gap(self, site: str, start_idx: int, end_idx: int, margin: int = 24) -> bool:
-        scores = self.anomaly_scores.get(site)
-        if scores is None or len(scores) == 0:
-            return False
-        left = max(0, start_idx - margin)
-        right = end_idx + margin
-        try:
-            local = scores[(scores.index >= left) & (scores.index < right)]
-            if len(local) == 0:
-                return False
-            return bool((local < -0.5).any())
-        except Exception:
-            return False
-
-    def _validate_and_fallback_recovery(self, df: pd.DataFrame, site: str, start_idx: int, end_idx: int, current_strategy: str) -> str:
-        """
-        VALIDATION LAYER: Check if recovered values match surrounding context.
-        If deviation > 40%, fallback to MEDIAN to prevent anomalous reconstructions.
-        
-        This prevents silent failures like the Feb 9-12 anomaly (76% error).
-        """
-        try:
-            # Get recovered values
-            recovered_vals = df.loc[start_idx:end_idx - 1, site].to_numpy(dtype=float)
-            if np.all(np.isnan(recovered_vals)):
-                return current_strategy
-            
-            recovered_valid = recovered_vals[~np.isnan(recovered_vals)]
-            if len(recovered_valid) == 0:
-                return current_strategy
-            
-            recovered_mean = np.nanmean(recovered_vals)
-            
-            # Get context: 24 hours before and after gap
-            context_margin = 144  # ~1 day in 10-min intervals
-            before_start = max(0, start_idx - context_margin)
-            after_end = min(len(df), end_idx + context_margin)
-            
-            before_vals = df.loc[before_start:start_idx - 1, site].to_numpy(dtype=float)
-            after_vals = df.loc[end_idx:after_end, site].to_numpy(dtype=float)
-            
-            before_valid = before_vals[~np.isnan(before_vals)]
-            after_valid = after_vals[~np.isnan(after_vals)]
-            
-            if len(before_valid) == 0 or len(after_valid) == 0:
-                return current_strategy
-            
-            before_mean = np.nanmean(before_valid)
-            after_mean = np.nanmean(after_valid)
-            context_mean = (before_mean + after_mean) / 2
-            
-            # Compute deviation
-            if context_mean > 0:
-                deviation = abs(recovered_mean - context_mean) / context_mean
-            else:
-                return current_strategy
-            
-            # If deviation > 40%, use MEDIAN fallback
-            if deviation > 0.40:
-                # MEDIAN fallback: average of before/after context
-                df.loc[start_idx:end_idx - 1, site] = context_mean
-                return f"{current_strategy}_FALLBACK_MEDIAN_{deviation:.1%}"
-            
-            return current_strategy
-            
-        except Exception as e:
-            # On any error, keep original strategy
-            return current_strategy
-
-    def _fill_pilotage_standard(self, df: pd.DataFrame, site: str, start_idx: int, end_idx: int, gap_size: int):
-        """Template + rolling + peer-correlation weighted fill for short-medium gaps.
-        FIX #3: templates guaranteed built before entry.
-        FIX #9: peer weights driven by actual correlation coefficient.
-        """
-        rolling = self._rolling or {}
-
-        w_t, w_r, w_p_base = (0.2, 0.7, 0.1) if gap_size >= 144 else (0.5, 0.3, 0.2)
-
-        # Pre-sort peers by correlation strength (FIX #9)
-        sorted_peers = sorted(
-            self.peer_correlations.get(site, {}).items(),
-            key=lambda kv: -abs(kv[1]),
-        )[:3]
-
-        # Vectorize the loop where possible (PERF #12)
-        for idx in range(start_idx, min(end_idx, len(df))):
-            row = df.loc[idx]
-            ts = row['Timestamp']
-            air_temp = row.get('AirTemp', np.nan)
-            regime, season, day_type = self._classify_conditions(ts, air_temp)
-            # Use cached format or compute once per timestamp
-            hour_min = self._hm_cache.get(ts)
-            if hour_min is None:
-                hour_min = f"{ts.hour:02d}:{ts.minute:02d}"
-                self._hm_cache[ts] = hour_min
-
-            is_extreme = not np.isnan(air_temp) and (air_temp < 5.0 or air_temp > 25.0)
-            wt = w_t * 1.3 if is_extreme else w_t
-
-            sources, weights = [], []
-
-            tv = self._get_template_value(site, regime, season, day_type, hour_min)
-            if not np.isnan(tv):
-                sources.append(tv)
-                weights.append(wt)
-
-            rv = rolling.get(site, {}).get(hour_min, np.nan)
-            if not np.isnan(rv):
-                sources.append(rv)
-                weights.append(w_r)
-
-            # Correlation-weighted peers (FIX #9)
-            for peer, corr in sorted_peers:
-                if peer in df.columns and not pd.isna(df.loc[idx, peer]):
-                    sources.append(df.loc[idx, peer])
-                    weights.append(w_p_base * abs(corr))
-
-            if sources:
-                w = np.array(weights)
-                df.loc[idx, site] = np.average(sources, weights=w / w.sum())
-
-    def _fill_close_day(self, df: pd.DataFrame, site: str, start_idx: int, end_idx: int):
-        """Fill close days (near-zero load) using median of historical close-day profiles.
-        
-        Close days have fundamentally different patterns than holidays:
-        - Holiday: reduced but structured (heating/AC off, minimal misc load)
-        - Close: near-zero or minimal (complete site closure)
-        
-        This method anchors the close-day template to observed edge values to handle
-        partial closures or operational variations.
-        """
-        templates = self._templates or {}
-        ts = df.loc[start_idx, 'Timestamp']
-        temp = df.loc[start_idx, 'AirTemp'] if 'AirTemp' in df.columns else np.nan
-        regime, season, _ = self._classify_conditions(ts, temp)
-
-        site_tpl = templates.get(site, {})
-        close_profile = site_tpl.get(regime, {}).get(season, {}).get('close', {})
-
-        if not close_profile:
-            close_profile = self._fallback_template(site, regime, season, 'close')
-
-        # Extract time-of-day values and substitute from template
-        rows = df.loc[start_idx:end_idx-1, 'Timestamp']
-        hm_arr = rows.dt.strftime('%H:%M').to_numpy()
-        vals = np.array([close_profile.get(hm, np.nan) for hm in hm_arr], dtype=float)
-
-        # Anchor to observed edges if available (handle scaling variations)
-        if start_idx > 0 and end_idx < len(df):
-            before = df.loc[start_idx-1, site]
-            after = df.loc[end_idx, site]
-            if pd.notna(before) and pd.notna(vals[0]) and vals[0] > 0:
-                scale = before / vals[0]
-                vals *= np.clip(scale, 0.5, 2.0)
-
-        df.loc[start_idx:end_idx-1, site] = vals
-
-    def _fill_ensemble(self, df: pd.DataFrame, site: str, start_idx: int, end_idx: int, gap_size: int):
-        """Weighted ensemble of template, spline, fourier (+ similar-day for long gaps).
-
-        Long outages tend to drift when only local methods are blended, so we
-        add a similar-day component for gap_size > 72 to preserve diurnal shape.
-        
-        SMOOTHNESS DETECTION: For very flat days (std dev < 5000 kW), reduces template
-        weight and increases spline weight to prevent false structure injection.
-        """
-        gap_len = end_idx - start_idx
-
-        method_results = {}
-        for name, fn in [
-            ('template', self._method_template_multi_scale),
-            ('spline', self._method_spline),
-            ('fourier', self._method_fourier),
-        ]:
-            try:
-                method_results[name] = fn(df, site, start_idx, end_idx)
-            except Exception:
-                method_results[name] = np.full(gap_len, np.nan)
-
-        if gap_size > 72:
-            try:
-                method_results['similar_day'] = self._method_similar_day_profile(df, site, start_idx, end_idx)
-            except Exception:
-                method_results['similar_day'] = np.full(gap_len, np.nan)
-
-        # SMOOTHNESS DETECTION: Check if gap pattern is unusually flat
-        # This helps detect Sundays or other flat patterns where template shouldn't dominate
-        # Use similar-day method (which shows ACTUAL historical days) to detect smoothness
-        is_smooth_day = False
-        if gap_size > 72 and not np.all(np.isnan(method_results.get('similar_day', [np.nan]))):
-            # Check the similar-day method's output (actual historical pattern)
-            similar_vals = method_results['similar_day'][~np.isnan(method_results['similar_day'])]
-            if len(similar_vals) > 10:
-                hourly_similar = []
-                for h in range(min(24, gap_len // 6)):
-                    h_start = h * 6
-                    h_end = min((h + 1) * 6, len(similar_vals))
-                    if h_end > h_start:
-                        hourly_similar.append(np.mean(similar_vals[h_start:h_end]))
-                
-                if len(hourly_similar) >= 8:
-                    hourly_std = np.std(hourly_similar)
-                    is_smooth_day = hourly_std < self.low_variance_threshold
-
-        # Base confidences (FIX #11: percentile bounds inside _assess_method_confidence)
-        confidences = {
-            name: self._assess_method_confidence(df, site, vals)
-            for name, vals in method_results.items()
-        }
-
-        # SMOOTHNESS ADJUSTMENT: For very flat days, heavily favor spline over template
-        if is_smooth_day:
-            # On smooth days, spline (edge-anchored) is much better than template
-            # Template often mis-predicts shape for weekly anomalies (flat Sundays, etc.)
-            confidences['template'] *= 0.15   # Heavily reduce template weight
-            confidences['spline'] *= 4.0      # Strongly boost spline weight
-            confidences['fourier'] *= 0.7     # Slightly reduce fourier (less needed for flat days)
-
-        # FIX #10: temperature regime modifier
-        if 'AirTemp' in df.columns:
-            temp = df.loc[start_idx, 'AirTemp'] if start_idx < len(df) else np.nan
-            if not np.isnan(temp) and (temp < 5 or temp > 25):
-                confidences['template'] *= 1.3
-                confidences['spline'] *= 0.8
-
-        if 'similar_day' in confidences:
-            # Prefer pattern-based fill on long gaps where local interpolation drifts.
-            confidences['similar_day'] *= 1.4
-
-        total_conf = sum(confidences.values())
-        if total_conf == 0:
-            return
-
-        # FIX #8: position-aware weights
-        # position 0 = gap start, 1 = gap end; spline is strongest at edges
-        position = np.linspace(0.0, 1.0, gap_len)
-        edge_proximity = 1.0 - 2.0 * np.abs(position - 0.5)   # 1 at edges, 0 at centre
-
-        ensemble_sum = np.zeros(gap_len)
-        ensemble_wsum = np.zeros(gap_len)
-
-        for name, vals in method_results.items():
-            if np.all(np.isnan(vals)):
-                continue
-            base_w = confidences[name] / total_conf
-
-            if name == 'spline':
-                pos_w = (1.0 + edge_proximity) * base_w      # up to 2× at edges
-            elif name == 'template':
-                pos_w = (1.0 + (1.0 - edge_proximity)) * base_w  # up to 2× at centre
-            elif name == 'similar_day':
-                # Similar-day should dominate gap centre but not the edges.
-                pos_w = (1.0 + 1.5 * (1.0 - edge_proximity)) * base_w
-            else:
-                pos_w = np.full(gap_len, base_w)
-
-            valid = ~np.isnan(vals)
-            ensemble_sum[valid] += pos_w[valid] * vals[valid]
-            ensemble_wsum[valid] += pos_w[valid]
-
-        ensemble_values = np.divide(
-            ensemble_sum, ensemble_wsum,
-            out=np.full(gap_len, np.nan),
-            where=ensemble_wsum > 0,
-        )
-
-        # Interpolate any remaining NaN positions
-        nan_mask = np.isnan(ensemble_values)
-        if np.any(nan_mask):
-            valid_idx = np.where(~nan_mask)[0]
-            if len(valid_idx) > 1:
-                ensemble_values[nan_mask] = np.interp(
-                    np.where(nan_mask)[0], valid_idx, ensemble_values[valid_idx]
-                )
-            elif len(valid_idx) == 1:
-                ensemble_values[nan_mask] = ensemble_values[valid_idx[0]]
-            else:
-                ensemble_values[:] = np.nanmean(df[site])
-
-        df.loc[start_idx:end_idx - 1, site] = ensemble_values
-
-    def _method_similar_day_profile(self, df: pd.DataFrame, site: str, start_idx: int, end_idx: int) -> np.ndarray:
-        """Build a long-gap profile from nearby days with similar edge levels.
-
-        Uses same time-of-day slices from previous days, scores candidates by
-        edge consistency, and blends top candidates by inverse error.
-        BUGFIX: Only uses candidates with same day_type (weekday/weekend/holiday).
-        """
-        gap_len = end_idx - start_idx
-        if gap_len <= 0:
-            return np.array([])
-
-        raw = df[site].to_numpy(dtype=float)
-        if start_idx <= 0 or end_idx >= len(raw):
-            return np.full(gap_len, np.nan)
-
-        before_edge = raw[start_idx - 1]
-        after_edge = raw[end_idx] if end_idx < len(raw) else np.nan
-        if np.isnan(before_edge) or np.isnan(after_edge):
-            return np.full(gap_len, np.nan)
-
-        if 'Timestamp' not in df.columns:
-            return np.full(gap_len, np.nan)
-
-        target_day_type = self._classify_day_type(df.loc[start_idx, 'Timestamp'])
-
-        candidates = []
-        scores = []
-
-        for d in range(1, 22):
-            s = start_idx - d * 144
-            e = s + gap_len
-            if s <= 0 or e >= len(raw):
-                continue
-            seg = raw[s:e]
-            if np.isnan(seg).any():
-                continue
-
-            seg_before = raw[s - 1]
-            seg_after = raw[e] if e < len(raw) else np.nan
-            if np.isnan(seg_before) or np.isnan(seg_after):
-                continue
-
-            candidate_day_type = self._classify_day_type(df.loc[s, 'Timestamp'])
-            
-            if candidate_day_type != target_day_type:
-                continue
-
-            edge_err = abs(seg_before - before_edge) + abs(seg_after - after_edge)
-            level_err = abs(np.mean(seg) - 0.5 * (before_edge + after_edge))
-            score = edge_err + 0.25 * level_err
-
-            candidates.append(seg)
-            scores.append(score)
-
-        if len(candidates) == 0:
-            return np.full(gap_len, np.nan)
-
-        order = np.argsort(scores)[:5]
-        top = np.array([candidates[i] for i in order])
-        top_scores = np.array([scores[i] for i in order], dtype=float)
-        weights = 1.0 / (top_scores + 1e-6)
-        weights = weights / weights.sum()
-        blended = np.average(top, axis=0, weights=weights)
-
-        start_offset = before_edge - blended[0]
-        end_offset = after_edge - blended[-1]
-        ramp = np.linspace(start_offset, end_offset, gap_len)
-        return blended + ramp
-
-    def _align_to_edge_levels(self, df: pd.DataFrame, site: str, start_idx: int, end_idx: int, lookback: int = 36, divergence_context: int = 288):
-        """Nudge long-gap fill to match edge means and trends.
-
-        Caps the per-edge offset at half the donor's std so the linspace ramp
-        cannot shift the whole gap. When the wider context is divergent, the
-        slope-blend weight drops to 0, slopes from a flat side and a
-        high-cycle side are not comparable.
-
-        Returns a dict describing the decision for the strategy_log.
-        """
-        filled = df.loc[start_idx:end_idx - 1, site].to_numpy(dtype=float)
-        if len(filled) == 0 or np.isnan(filled).all():
-            return None
-
-        before = df.loc[max(0, start_idx - lookback):start_idx - 1, site].dropna()
-        after = df.loc[end_idx:min(len(df) - 1, end_idx + lookback), site].dropna()
-        if len(before) == 0 or len(after) == 0:
-            return None
-
-        # Reuse the same wide window as _normalize_long_gap_amplitude so the
-        # two stages agree on what "divergent" means.
-        wb = df.loc[max(0, start_idx - divergence_context):start_idx - 1, site].dropna().to_numpy(dtype=float)
-        wa = df.loc[end_idx:min(len(df) - 1, end_idx + divergence_context), site].dropna().to_numpy(dtype=float)
-        if len(wb) > 0 and len(wa) > 0:
-            div = self._context_divergence(wb, wa)
-        else:
-            div = {'is_divergent': False}
-
-        raw_start = float(before.mean() - filled[0])
-        raw_end = float(after.mean() - filled[-1])
-
-        cap = 0.5 * float(np.std(filled))
-        if cap > 0:
-            start_offset = float(np.clip(raw_start, -cap, cap))
-            end_offset = float(np.clip(raw_end, -cap, cap))
-        else:
-            start_offset, end_offset = raw_start, raw_end
-
-        if len(before) >= 4:
-            before_times = np.arange(len(before))
-            before_slope = np.polyfit(before_times[-4:], before.values[-4:], 1)[0]
-        else:
-            before_slope = 0.0
-
-        if len(after) >= 4:
-            after_times = np.arange(len(after))
-            after_slope = np.polyfit(after_times[:4], after.values[:4], 1)[0]
-        else:
-            after_slope = 0.0
-
-        gap_pos = np.linspace(0.0, 1.0, len(filled))
-
-        level_ramp = start_offset + (end_offset - start_offset) * gap_pos
-
-        filled_times = np.arange(len(filled))
-        slope_ramp = before_slope + (after_slope - before_slope) * gap_pos
-
-        adjusted = filled + level_ramp
-
-        slope_weight = 0.0 if div.get('is_divergent') else 0.2
-        if len(filled) > 1 and slope_weight > 0:
-            # NOTE: original code wrote `filled[0]` here, conflating the value
-            # of the first filled point with the time index zero. With filled[0]
-            # ~ 100k W, the correction blew up to ±10⁵ and made the engine
-            # produce wildly extrapolated values that the >40% validation
-            # fallback then collapsed to a flat constant. Use the time index.
-            quad_correction = (
-                (before_slope * (1.0 - gap_pos) + after_slope * gap_pos)
-                * (filled_times - filled_times[0])
-                / (len(filled) - 1)
-            )
-            adjusted = adjusted + slope_weight * quad_correction
-
-        df.loc[start_idx:end_idx - 1, site] = adjusted
-        capped = (raw_start != start_offset) or (raw_end != end_offset)
-        return {
-            'mode': 'align_capped' if capped else 'align_normal',
-            'cap': float(cap),
-            'start_offset_raw': float(raw_start),
-            'start_offset_applied': float(start_offset),
-            'end_offset_raw': float(raw_end),
-            'end_offset_applied': float(end_offset),
-            'slope_weight': float(slope_weight),
-        }
-
-
-    def _context_divergence(self, before: np.ndarray, after: np.ndarray) -> dict:
-        # A divergent context means averaging the two sides erases the donor's
-        # natural cycle, see plan note about Easter (flat-low) vs working week.
-        if len(before) == 0 or len(after) == 0:
-            return {'mean_ratio': 1.0, 'std_ratio': 1.0, 'is_divergent': False}
-        eps = 1e-6
-        b_mean, a_mean = float(np.mean(before)), float(np.mean(after))
-        b_std, a_std = float(np.std(before)), float(np.std(after))
-        mean_ratio = max(b_mean, a_mean) / max(min(b_mean, a_mean), eps)
-        std_ratio = max(b_std, a_std) / max(min(b_std, a_std), eps)
-        is_divergent = (std_ratio > 3.0) or (mean_ratio > 1.4)
-        return {
-            'mean_ratio': float(mean_ratio),
-            'std_ratio': float(std_ratio),
-            'is_divergent': bool(is_divergent),
-        }
-
-    def _normalize_long_gap_amplitude(self, df: pd.DataFrame, site: str, start_idx: int, end_idx: int, context: int = 288):
-        """Affine-normalize long-gap fill to nearby observed mean/std.
-
-        Returns a dict describing the decision (mode, ratios, scale) for the
-        strategy_log.
-        """
-        filled = df.loc[start_idx:end_idx - 1, site].to_numpy(dtype=float)
-        if len(filled) == 0 or np.isnan(filled).all():
-            return None
-
-        before = df.loc[max(0, start_idx - context):start_idx - 1, site].dropna().to_numpy(dtype=float)
-        after = df.loc[end_idx:min(len(df) - 1, end_idx + context), site].dropna().to_numpy(dtype=float)
-        if len(before) == 0 or len(after) == 0:
-            return None
-
-        div = self._context_divergence(before, after)
-        # Keep the symmetric average even when the contexts diverge: the
-        # edge-alignment cap in _align_to_edge_levels is what bounds the
-        # over/under-shoot, not the picker. The divergence flag is still
-        # logged so the mode can be read back from the strategy log.
-        target_mean = 0.5 * (float(np.mean(before)) + float(np.mean(after)))
-        target_std = 0.5 * (float(np.std(before)) + float(np.std(after)))
-        mode = 'norm_divergent_symmetric' if div['is_divergent'] else 'norm_symmetric'
-
-        cur_mean = float(np.mean(filled))
-        cur_std = float(np.std(filled))
-        if cur_std < 1e-6:
-            adjusted = filled - cur_mean + target_mean
-            scale_applied = 1.0
-        else:
-            scale = target_std / cur_std if target_std > 1e-6 else 1.0
-            scale = float(np.clip(scale, 0.6, 1.8))
-            adjusted = (filled - cur_mean) * scale + target_mean
-            scale_applied = scale
-
-        df.loc[start_idx:end_idx - 1, site] = adjusted
-        return {
-            'mode': mode,
-            'std_ratio': float(div['std_ratio']),
-            'mean_ratio': float(div['mean_ratio']),
-            'scale_applied': float(scale_applied),
-        }
-
-    def _method_template_multi_scale(self, df: pd.DataFrame, site: str, start_idx: int, end_idx: int) -> np.ndarray:
-        trend = self._extract_trend(df, site, start_idx, end_idx)
-        seasonal = self._extract_seasonal(df, site, start_idx, end_idx, period=144)
-        weekly = self._extract_seasonal(df, site, start_idx, end_idx, period=1008)
-        yearly = self._extract_yearly_seasonal(df, site, start_idx, end_idx)
-        return 0.3 * trend + 0.3 * seasonal + 0.2 * weekly + 0.2 * yearly
-
-    def _extract_trend(self, df: pd.DataFrame, site: str, start_idx: int, end_idx: int) -> np.ndarray:
-        before = df.loc[max(0, start_idx - 48):start_idx - 1, site].dropna()
-        after = df.loc[end_idx:min(len(df) - 1, end_idx + 48), site].dropna()
-        if len(before) > 0 and len(after) > 0:
-            return np.linspace(before.iloc[-1], after.iloc[0], end_idx - start_idx)
-        bv = df.loc[start_idx - 1, site] if start_idx > 0 else np.nan
-        av = df.loc[end_idx, site] if end_idx < len(df) else np.nan
-        if pd.isna(bv) or pd.isna(av):
-            return np.full(end_idx - start_idx, np.nanmean(df[site]))
-        return np.linspace(bv, av, end_idx - start_idx)
-
-    def _extract_seasonal(self, df: pd.DataFrame, site: str, start_idx: int, end_idx: int, period: int) -> np.ndarray:
-        """PERF #5: fully vectorised 2-D numpy gather, zero Python loop over gap positions.
-
-        Builds a (gap_len, 8) index matrix of all lookback positions at once, gathers
-        values in a single fancy-index op, then takes nanmedian along axis=1.
-        """
-        raw = df[site].to_numpy(dtype=float)
-        gap_len = end_idx - start_idx
-
-        gap_positions = np.arange(start_idx, end_idx)                    # (gap_len,)
-        offsets = np.arange(1, 9) * period                               # (8,)
-        candidate_idx = gap_positions[:, None] - offsets[None, :]        # (gap_len, 8)
-
-        valid_mask = (candidate_idx >= 0) & (candidate_idx < start_idx)
-
-        safe_idx = np.clip(candidate_idx, 0, len(raw) - 1)
-        vals = raw[safe_idx]                                              # (gap_len, 8)
-        vals[~valid_mask] = np.nan
-
-        with np.errstate(all='ignore'):
-            seasonal = np.nanmedian(vals, axis=1)                        # (gap_len,)
-
-        nan_mask = np.isnan(seasonal)
-        if np.any(nan_mask):
-            valid_idx = np.where(~nan_mask)[0]
-            if len(valid_idx) > 1:
-                seasonal[nan_mask] = np.interp(
-                    np.where(nan_mask)[0], valid_idx, seasonal[valid_idx]
-                )
-            elif len(valid_idx) == 1:
-                seasonal[nan_mask] = seasonal[valid_idx[0]]
-            else:
-                seasonal[:] = np.nanmean(raw)
-
-        return seasonal
-
-    def _extract_yearly_seasonal(self, df: pd.DataFrame, site: str, start_idx: int, end_idx: int) -> np.ndarray:
-        """Extract seasonal pattern using same time-of-year from prior years.
-        
-        This captures multi-year seasonality (e.g., spring demand vs autumn demand at same temp).
-        Uses 10-min resolution: 144 periods/day, 365 days/year ≈ 52,560 periods/year.
-        """
-        raw = df[site].to_numpy(dtype=float)
-        gap_len = end_idx - start_idx
-        period_year = 144 * 365   # steps per year at 10-min resolution
-
-        gap_positions = np.arange(start_idx, end_idx)                    # (gap_len,)
-        offsets = np.arange(1, 4) * period_year                          # (3,), up to 3 years back
-        candidate_idx = gap_positions[:, None] - offsets[None, :]        # (gap_len, 3)
-
-        valid_mask = (candidate_idx >= 0) & (candidate_idx < start_idx)
-
-        safe_idx = np.clip(candidate_idx, 0, len(raw) - 1)
-        vals = raw[safe_idx]                                              # (gap_len, 3)
-        vals[~valid_mask] = np.nan
-
-        with np.errstate(all='ignore'):
-            yearly = np.nanmedian(vals, axis=1)                          # (gap_len,)
-
-        nan_mask = np.isnan(yearly)
-        if np.any(nan_mask):
-            valid_idx = np.where(~nan_mask)[0]
-            if len(valid_idx) > 1:
-                yearly[nan_mask] = np.interp(
-                    np.where(nan_mask)[0], valid_idx, yearly[valid_idx]
-                )
-            elif len(valid_idx) == 1:
-                yearly[nan_mask] = yearly[valid_idx[0]]
-            else:
-                yearly[:] = np.nanmean(raw)
-
-        return yearly
-
-    def _method_spline(self, df: pd.DataFrame, site: str, start_idx: int, end_idx: int) -> np.ndarray:
-        try:
-            before_idx = np.arange(max(0, start_idx - 48), start_idx)
-            after_idx = np.arange(end_idx, min(len(df), end_idx + 48))
-            before_vals = df.loc[before_idx, site].dropna()
-            after_vals = df.loc[after_idx, site].dropna()
-            if len(before_vals) >= 4 and len(after_vals) >= 4:
-                anchor_idx = np.concatenate([before_vals.index.values, after_vals.index.values])
-                anchor_vals = np.concatenate([before_vals.values, after_vals.values])
-                
-                before_slope = np.polyfit(np.arange(len(before_vals))[-4:], before_vals.values[-4:], 1)[0]
-                after_slope = np.polyfit(np.arange(len(after_vals))[:4], after_vals.values[:4], 1)[0]
-                
-                cs = CubicSpline(anchor_idx, anchor_vals, bc_type=((1, before_slope), (1, after_slope)))
-                return cs(np.arange(start_idx, end_idx))
-        except Exception:
-            pass
-        return np.full(end_idx - start_idx, np.nan)
-
-    def _method_fourier(self, df: pd.DataFrame, site: str, start_idx: int, end_idx: int) -> np.ndarray:
-        """FIX #2: exclude DC component before adding context.mean() offset."""
-        try:
-            context_size = min(288, start_idx)
-            context = df.loc[max(0, start_idx - context_size):start_idx - 1, site].dropna()
-            if len(context) >= 10:
-                fft_vals = fft(context.values)
-                magnitudes = np.abs(fft_vals)
-                magnitudes[0] = 0  # zero out DC so it is never selected
-                top_freqs = np.argsort(magnitudes)[-5:]
-
-                t_gap = np.arange(end_idx - start_idx)
-                reconstruction = np.zeros(end_idx - start_idx)
-                for freq in top_freqs:
-                    amp = np.abs(fft_vals[freq]) / len(context)
-                    phase = np.angle(fft_vals[freq])
-                    reconstruction += amp * np.cos(2 * np.pi * freq * t_gap / len(context) + phase)
-
-                if reconstruction.std() > 1e-6:
-                    reconstruction = reconstruction * (context.std() / reconstruction.std())
-
-                reconstruction += context.mean()
-                return reconstruction
-        except Exception:
-            pass
-        return np.full(end_idx - start_idx, np.nan)
-
-    def _assess_method_confidence(self, df: pd.DataFrame, site: str, values: np.ndarray) -> float:
-        """FIX #11: use 5th–95th percentile bounds instead of global min/max."""
-        if np.all(np.isnan(values)):
-            return 0.0
-
-        clean = values[~np.isnan(values)]
-        diffs = np.abs(np.diff(clean))
-        smoothness_score = 1.0 / (1 + np.mean(diffs) / 1000) if len(diffs) > 0 else 0.1
-
-        valid = df[site].dropna()
-        if len(valid) >= 20:
-            lo, hi = np.percentile(valid, 5), np.percentile(valid, 95)
-        else:
-            lo, hi = valid.min(), valid.max()
-
-        in_bounds = np.mean((clean >= lo) & (clean <= hi))
-        bounds_score = 0.5 + 0.5 * in_bounds
-
-        return smoothness_score * bounds_score
-
-    def _apply_adaptive_smoothing(self, df: pd.DataFrame, site: str, start_idx: int, end_idx: int):
-        values = df.loc[start_idx:end_idx - 1, site].values
-        if start_idx >= 24:
-            before = df.loc[max(0, start_idx - 24):start_idx - 1, site].dropna()
-            smoothness = np.mean(np.abs(np.diff(before.values))) if len(before) > 1 else 1000
-        else:
-            smoothness = 1000
-
-        if smoothness < 2000:
-            gap_len = end_idx - start_idx
-            window_len = min(11, gap_len if gap_len % 2 == 1 else gap_len - 1)
-            if window_len >= 5:
-                try:
-                    df.loc[start_idx:end_idx - 1, site] = savgol_filter(values, window_len, polyorder=2)
-                except Exception:
-                    pass
-
-    def _build_templates_if_needed(self, df: pd.DataFrame):
-        fingerprint = self._data_fingerprint(df)
-        if self._templates is not None and self._cache_fingerprint == fingerprint:
-            return self._templates
-
-        print("[INFO] Building templates...", flush=True)
-        self._build_temp_aware_templates(df)
-
-        self._rolling = {}
-        for site in self.site_cols:
-            if site not in df.columns:
-                continue
-            self._rolling[site] = (
-                df.groupby(df['Timestamp'].dt.strftime('%H:%M'))[site].mean().to_dict()
-            )
-
-        self._cache_fingerprint = fingerprint
-        self.cache_templates(fingerprint)
-        return self._templates
-
-    def _build_temp_aware_templates(self, df: pd.DataFrame):
-        """Build templates with 4-dimensional key: (regime, season, day_type, hour_min).
-        
-        BUG #1: each row classified using its OWN timestamp (not iloc[0]).
-        PERF #6: single groupby pass per site, sliced per regime/season/day_type.
-        PERF #8: vectorised regime + season + day_type assignment, no row-wise .apply().
-        """
-        self._templates = {}
-
-        data = df.copy()
-        if self.use_historical_data and self.historical_df is not None:
-            common = [c for c in self.site_cols if c in self.historical_df.columns]
-            hist_cols = [c for c in ['Timestamp'] + common if c in self.historical_df.columns]
-            curr_cols = ['Timestamp'] + common
-            data = pd.concat(
-                [self.historical_df[hist_cols], df[[c for c in curr_cols if c in df.columns]]],
-                ignore_index=True,
-            )
-
-        if 'AirTemp' in data.columns:
-            temps = data['AirTemp'].to_numpy(dtype=float)
-            regime = np.where(np.isnan(temps), 'mild',
-                     np.where(temps < 5,       'cold',
-                     np.where(temps > 20,      'hot', 'mild')))
-        else:
-            regime = np.full(len(data), 'mild', dtype=object)
-
-        months = data['Timestamp'].dt.month.to_numpy()
-        season = np.where(np.isin(months, [12, 1, 2]),   'winter',
-                 np.where(np.isin(months, [3, 4, 5]),    'spring',
-                 np.where(np.isin(months, [6, 7, 8]),    'summer', 'autumn')))
-
-        weekday_num = data['Timestamp'].dt.weekday.to_numpy()
-        dates = data['Timestamp'].dt.date.values
-        is_close = np.isin(dates, list(self.close_days))
-        is_holiday = np.isin(dates, list(self.holidays))
-        is_special = np.isin(dates, list(self.special_days))
-        
-        day_type = np.where(is_close,                'close',
-                   np.where(is_special,              'special',
-                   np.where(is_holiday,              'holiday',
-                   np.where(weekday_num == 4,        'friday',
-                   np.where(weekday_num == 5,        'saturday',
-                   np.where(weekday_num == 6,        'sunday', 'weekday'))))))
-
-        data['_regime']   = regime
-        data['_season']   = season
-        data['_day_type'] = day_type
-        data['_hm']       = data['Timestamp'].dt.strftime('%H:%M')
-
-        regimes = ['cold', 'mild', 'hot']
-        seasons = ['winter', 'spring', 'summer', 'autumn']
-        day_types = ['weekday', 'friday', 'saturday', 'sunday', 'holiday', 'close', 'special']
-
-        for site in self.site_cols:
-            if site not in data.columns:
-                continue
-            self._templates[site] = {}
-
-            grouped = data.groupby(['_regime', '_season', '_day_type', '_hm'])[site].mean()
-
-            for reg in regimes:
-                self._templates[site][reg] = {}
-                for seas in seasons:
-                    self._templates[site][reg][seas] = {}
-                    for dt in day_types:
-                        try:
-                            profile = grouped.loc[reg, seas, dt]
-                            self._templates[site][reg][seas][dt] = profile.to_dict()
-                        except KeyError:
-                            # Graceful fallback: use _fallback_template logic
-                            self._templates[site][reg][seas][dt] = {}
-
-    def _calculate_bounds(self, df: pd.DataFrame) -> Dict[str, Tuple[float, float]]:
-        bounds = {}
-        for site in self.site_cols:
-            if site in df.columns:
-                valid = df[site].dropna()
-                if len(valid) > 0:
-                    mn, mx = valid.min(), valid.max()
-                    margin = (mx - mn) * 0.05
-                    bounds[site] = (max(0.0, mn - margin), mx + margin)
-        return bounds
-
-    def _detect_anomalies(self, df: pd.DataFrame):
-        """Isolation Forest + O(n) stuck-value detection via rolling std (PERF #7)."""
-        for site in self.site_cols:
-            if site not in df.columns:
-                continue
-            valid = df[site].dropna()
-            if len(valid) < 10:
-                continue
-
-            scores = pd.Series(np.zeros(len(valid)), index=valid.index)
-
-            if IsolationForest is not None:
-                try:
-                    iso = IsolationForest(contamination=0.05, random_state=42)
-                    iso_scores = iso.fit_predict(valid.values.reshape(-1, 1))
-                    scores = pd.Series(iso_scores.astype(float), index=valid.index)
-                except Exception:
-                    pass
-
-            # Stuck-value detection: rolling std over 10 samples
-            rolling_std = df[site].rolling(window=10, min_periods=5).std()
-            stuck_mask = rolling_std < 1e-6
-            stuck_indices = df.index[stuck_mask & df[site].notna()]
-            for idx in stuck_indices:
-                scores[idx] = -1.0
-
-            self.anomaly_scores[site] = scores
-
-    def _calculate_peer_correlations(self, df: pd.DataFrame):
-        # Optimized: use corr() matrix instead of pairwise (PERF #15)
-        try:
-            cols_exist = [c for c in self.site_cols if c in df.columns]
-            if len(cols_exist) <= 1:
-                for site in cols_exist:
-                    self.peer_correlations[site] = {}
-                return
-            
-            corr_matrix = df[cols_exist].corr()
-            for site in cols_exist:
-                self.peer_correlations[site] = {}
-                for peer in cols_exist:
-                    if peer != site:
-                        val = corr_matrix.loc[site, peer]
-                        self.peer_correlations[site][peer] = float(val) if not np.isnan(val) else 0.0
-        except Exception:
-            for site in self.site_cols:
-                self.peer_correlations[site] = {}
-
-    def _compute_output_confidence_bounds(self, df: pd.DataFrame):
-        rmse_base = 8.0
-        base_width = 1.96 * rmse_base
-        
-        for site in self.site_cols:
-            if site not in df.columns:
-                continue
-            bounds_dict = {}
-            
-            # Vectorized anomaly score lookup (PERF #18)
-            anom_scores = self.anomaly_scores.get(site, pd.Series(dtype=bool))
-            anom_mask_array = np.zeros(len(df), dtype=bool)
-            if len(anom_scores) > 0:
-                try:
-                    anom_mask_array = (anom_scores < -0.5).to_numpy() if hasattr(anom_scores, 'to_numpy') else (anom_scores < -0.5)
-                except:
-                    pass
-            
-            # Vectorized temperature check (PERF #18)
-            temps = df['AirTemp'].to_numpy(dtype=float) if 'AirTemp' in df.columns else np.full(len(df), np.nan)
-            temp_extreme = (temps < 0) | (temps > 30)
-            
-            site_values = df[site].to_numpy(dtype=float)
-            valid_mask = ~np.isnan(site_values)
-            
-            for idx in np.where(valid_mask)[0]:
-                width = base_width
-                if idx < len(anom_mask_array) and anom_mask_array[idx]:
-                    width *= 1.5
-                if idx < len(temps) and not np.isnan(temps[idx]) and temp_extreme[idx]:
-                    width *= 1.2
-                val = site_values[idx]
-                bounds_dict[idx] = (max(0.0, val - width), val + width)
-            
-            if bounds_dict:
-                self.confidence_bounds[site] = bounds_dict
+        """Legacy shim, returns an empty DataFrame with the old columns."""
+        log.debug("[LEGACY] benchmark called; returning empty frame in the new engine")
+        return pd.DataFrame(columns=['site', 'gap_length', 'run', 'strategy', 'mae', 'rmse'])

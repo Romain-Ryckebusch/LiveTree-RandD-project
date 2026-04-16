@@ -72,22 +72,24 @@ def set_history_source(df: Optional[pd.DataFrame], building_column: str) -> None
 # 8 weeks: minimum context the long-gap ensemble needs before its >40% fallback kicks in.
 _PREPEND_DAYS = 56
 
+# Strategy codes emitted by TemperatureAwareHybridEngine (hybrid_engine.py).
+# Quality flags: 1=linear, 2=contextual, 3=donor-day.
 _STRATEGY_FLAG_MAP = {
-    "L1_LINEAR_MICRO": 2,
-    "L2_LINEAR_TEMP": 2,
-    "L3_SPLINE": 2,
-    "L3_PILOTAGE_FALLBACK": 2,
-    "L4_ANOMALY_GUARDED": 2,
-    "L4_TEMP_AWARE": 2,
-    "L5_DAY_SCALE_PILOTAGE": 3,
-    "L6_MULTI_DAY_ENSEMBLE": 3,
-    "L7_VERY_LONG_ENSEMBLE": 3,
+    "LINEAR_MICRO": 1,
+    "LINEAR_SHORT": 1,
+    "THERMAL_TEMPLATE": 2,
+    "ENHANCED_TEMPLATE": 2,
+    "WEEKEND_TEMPLATE_SATURDAY": 2,
+    "WEEKEND_TEMPLATE_SUNDAY": 2,
+    "WEEKEND_TEMPLATE_MIXED": 2,
+    "SAFE_LINEAR_MEDIAN": 2,
+    "PEER_CORRELATION": 2,
+    "MULTI_WEEK_TEMPLATE": 3,
+    "SAFE_MEDIAN": 3,
 }
 
 
 def _flag_for_strategy(strategy: str) -> int:
-    if "_FALLBACK_MEDIAN_" in strategy:
-        return 3
     return _STRATEGY_FLAG_MAP.get(strategy, 2)
 
 
