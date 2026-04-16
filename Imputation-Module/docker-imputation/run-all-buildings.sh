@@ -4,7 +4,7 @@
 #
 # Usage:
 #   CASSANDRA_HOSTS=10.64.253.14 ./run-all-buildings.sh [TARGET_DATE] \
-#     [--test-gap START END]...
+#     [--test-gap START END]... [--overlay-prior-week]
 #
 # TARGET_DATE defaults to today (UTC). The 7-day window ending the day
 # before TARGET_DATE is what actually gets reconstructed.
@@ -13,12 +13,16 @@
 # run also emits a test_report CSV (MAE/RMSE/max) and output filenames
 # are suffixed with _test so clean reconstructions are not overwritten.
 # START/END are naive Europe/Paris datetimes, e.g. '2026-04-14 08:00'.
+#
+# --overlay-prior-week adds a dashed purple curve to each PNG showing the
+# 7 days preceding the reconstructed window (shifted +7 days), i.e. a naive
+# "copy last week" baseline for visually comparing against our algorithm.
 
 set -euo pipefail
 
 die() {
   echo "ERROR: $*" >&2
-  echo "Usage: $0 [TARGET_DATE] [--test-gap START END]..." >&2
+  echo "Usage: $0 [TARGET_DATE] [--test-gap START END]... [--overlay-prior-week]" >&2
   exit 1
 }
 
@@ -30,12 +34,17 @@ else
 fi
 
 GAP_ARGS=()
+OVERLAY_ARG=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --test-gap)
       [[ $# -ge 3 ]] || die "--test-gap requires 2 arguments (START END)"
       GAP_ARGS+=(--test-gap "$2" "$3")
       shift 3
+      ;;
+    --overlay-prior-week)
+      OVERLAY_ARG=(--overlay-prior-week)
+      shift
       ;;
     *)
       die "unknown argument: $1"
@@ -66,6 +75,10 @@ for B in "${BUILDINGS[@]}"; do
   if $TEST_MODE; then
     cmd_args+=("${GAP_ARGS[@]}")
     cmd_args+=(--test-report "/io/test_report_${B}_${TARGET_DATE}.csv")
+  fi
+
+  if [[ ${#OVERLAY_ARG[@]} -gt 0 ]]; then
+    cmd_args+=("${OVERLAY_ARG[@]}")
   fi
 
   docker compose run --rm imputer "${cmd_args[@]}"

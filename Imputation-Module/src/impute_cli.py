@@ -277,10 +277,13 @@ def load_input(path):
     return df, timestamp_strings
 
 
-def load_cassandra_window(target_date, building_column):
+def load_cassandra_window(target_date, building_column, include_prior_week=False):
     """Pull history + weather from Cassandra and extract the 7-day window.
 
-    Returns the same (df, timestamp_strings) tuple as load_input, and seeds
+    Returns ``(df, timestamp_strings, prior_week_values)`` where
+    ``prior_week_values`` is a length-1008 ndarray of the 7 days preceding the
+    reconstructed window (in source order, NaN where missing) when
+    ``include_prior_week`` is True, else ``None``. The function also seeds
     imputer's history cache for ``building_column``. For Ptot_Campus the
     column is built as the sum of the four buildings with skipna=False, so a
     single missing component leaves the row missing.
@@ -348,7 +351,39 @@ def load_cassandra_window(target_date, building_column):
         "timestamp": history["Date"],
         "value": history[building_column].astype(float),
     })
-    return df, timestamp_strings
+
+    prior_week_values = None
+    if include_prior_week:
+        prior_target = pd.Timestamp(target_date) - pd.Timedelta(days=7)
+        try:
+            prior_history, _p_ts, _p_weather, _p_actual = extract_window(
+                hist_df, prior_target, weather_df, building_column=building_column
+            )
+        except Exception as exc:
+            fail(
+                f"extract_window failed for prior week {prior_target.date()}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        if len(prior_history) != EXPECTED_ROWS:
+            fail(
+                f"Cassandra prior-week window for {prior_target.date()} has "
+                f"{len(prior_history)} rows, expected {EXPECTED_ROWS}"
+            )
+        prior_week_values = prior_history[building_column].astype(float).to_numpy()
+        n_prior_nan = int(np.isnan(prior_week_values).sum())
+        if n_prior_nan == EXPECTED_ROWS:
+            print(
+                f"[WARN] prior-week window for {prior_target.date()} is entirely "
+                f"missing; overlay line will not be visible.",
+                file=sys.stderr,
+            )
+        elif n_prior_nan > 0:
+            print(
+                f"[NOTE] prior-week window has {n_prior_nan}/{EXPECTED_ROWS} "
+                f"missing point(s); overlay will show gaps.",
+            )
+
+    return df, timestamp_strings, prior_week_values
 
 
 def main():
@@ -388,6 +423,14 @@ def main():
         help="Optional PNG path. If given, renders a reconstruction overlay plot alongside the output CSV.",
     )
     parser.add_argument(
+        "--overlay-prior-week", action="store_true",
+        help=(
+            "Cassandra mode: overlay the 7 days preceding the reconstructed "
+            "window on the plot (shifted +7 days) as a naive 'copy last week' "
+            "baseline for comparison. Ignored in CSV mode."
+        ),
+    )
+    parser.add_argument(
         "--seed", type=int, default=None,
         help="Optional random seed for deterministic imputation.",
     )
@@ -410,6 +453,7 @@ def main():
     )
     args = parser.parse_args()
 
+    prior_week_values = None
     if args.source == "csv":
         if not args.input:
             fail("--input is required when --source=csv")
@@ -418,12 +462,21 @@ def main():
                 f"[NOTE] --building={args.building} is ignored in CSV mode "
                 f"(CSV uses a generic 'value' column)."
             )
+        if args.overlay_prior_week:
+            print(
+                "[NOTE] --overlay-prior-week is ignored in CSV mode "
+                "(no prior-week data available in a single-window CSV).",
+                file=sys.stderr,
+            )
         df, timestamp_strings = load_input(args.input)
         building_column = BUILDING_COLUMN
     else:
         if not args.target_date:
             fail("--target-date is required when --source=cassandra")
-        df, timestamp_strings = load_cassandra_window(args.target_date, args.building)
+        df, timestamp_strings, prior_week_values = load_cassandra_window(
+            args.target_date, args.building,
+            include_prior_week=args.overlay_prior_week,
+        )
         building_column = args.building
 
     gt_values = None
@@ -493,6 +546,7 @@ def main():
             render(
                 args.output, args.plot, building_column,
                 masked_ranges=test_gaps,
+                prior_week_values=prior_week_values,
             )
         except Exception as exc:
             fail(f"plot_reconstruction.render() raised {type(exc).__name__}: {exc}")

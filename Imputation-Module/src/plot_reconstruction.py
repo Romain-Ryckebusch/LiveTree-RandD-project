@@ -35,6 +35,7 @@ def render(
     png_path: str,
     building_column: str,
     masked_ranges=None,
+    prior_week_values=None,
 ) -> None:
     df = pd.read_csv(csv_path)
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
@@ -58,6 +59,16 @@ def render(
         df["timestamp"], df["value"],
         color="0.7", linewidth=1.0, zorder=1, label="Reconstructed series",
     )
+    if prior_week_values is not None:
+        assert len(prior_week_values) == len(df), (
+            f"prior_week_values length {len(prior_week_values)} != "
+            f"reconstructed window length {len(df)}"
+        )
+        ax.plot(
+            df["timestamp"], prior_week_values,
+            color="tab:purple", linestyle="--", linewidth=1.2, alpha=0.7,
+            zorder=1, label="Previous week (naive baseline)",
+        )
     for flag, (label, color) in QUALITY_LABELS.items():
         mask = df["quality"] == flag
         if not mask.any():
