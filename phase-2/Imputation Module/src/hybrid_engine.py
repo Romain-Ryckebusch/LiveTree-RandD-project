@@ -366,6 +366,14 @@ class TemperatureAwareHybridEngine:
             recent_mask = df['Timestamp'] >= recent_cutoff
             historical_mask = (df['Timestamp'] >= min_date) & (df['Timestamp'] < recent_cutoff)
 
+            # Exclude holidays from the per-day-of-week template. Otherwise a
+            # single holiday that happens to land on a given DoW (e.g. Easter
+            # Sunday) biases that DoW's template on every non-holiday
+            # occurrence of the same DoW.
+            non_holiday_mask = (
+                ~df['IsHoliday'] if 'IsHoliday' in df.columns else pd.Series(True, index=df.index)
+            )
+
             for site in self.site_cols:
                 if site not in df.columns:
                     continue
@@ -379,12 +387,12 @@ class TemperatureAwareHybridEngine:
 
                     for hour in range(24):
                         recent = df.loc[
-                            recent_mask & (df['DayOfWeek'] == day_name) &
+                            recent_mask & non_holiday_mask & (df['DayOfWeek'] == day_name) &
                             (df['Hour'] == hour) & (df[site].notna()), site
                         ].values
 
                         historical = df.loc[
-                            historical_mask & (df['DayOfWeek'] == day_name) &
+                            historical_mask & non_holiday_mask & (df['DayOfWeek'] == day_name) &
                             (df['Hour'] == hour) & (df[site].notna()), site
                         ].values
 
@@ -461,6 +469,7 @@ class TemperatureAwareHybridEngine:
                         confidences.append(0.0)
 
             filled_vals = np.array(filled_vals, dtype=float)
+            filled_vals = self._apply_edge_calibration(df, site, filled_vals, gap_start, gap_end)
             filled_vals = self._validate_and_clip(filled_vals, site, df)
             df.loc[gap_start:gap_end - 1, site] = filled_vals
 
@@ -904,6 +913,77 @@ class TemperatureAwareHybridEngine:
     # ─────────────────────────────────────────────────────────────────
     # Validation + smoothing + final NaN guard
     # ─────────────────────────────────────────────────────────────────
+
+    def _apply_edge_calibration(
+        self,
+        df: pd.DataFrame,
+        site: str,
+        filled_vals: np.ndarray,
+        gap_start: int,
+        gap_end: int,
+        lookback: int = 144,
+    ) -> np.ndarray:
+        """Scale template fills so their level matches real data adjacent
+        to the gap.
+
+        The multi-week template is a 28-day blend (70% recent / 30% older)
+        and preserves shape well but can be biased on absolute level when
+        consumption is trending. Without edge anchoring, end-of-window
+        reconstructions (e.g. imputing the day after the last real day)
+        come out systematically ~20% too high.
+
+        The correction is a single multiplicative scale computed from the
+        24h of real data next to the gap:
+            scale = mean(actual) / mean(template_predictions_at_same_slots)
+        Clipped to [0.5, 2.0] to guard against degenerate calibration
+        windows. Returns `filled_vals` unchanged when no side has enough
+        real data to calibrate against.
+        """
+        scale = self._compute_template_scale(df, site, max(0, gap_start - lookback), gap_start)
+        if scale is None:
+            scale = self._compute_template_scale(df, site, gap_end, min(len(df), gap_end + lookback))
+        if scale is None:
+            return filled_vals
+
+        if abs(scale - 1.0) > 0.005:
+            log.debug(f"[CALIBRATION] {site} gap[{gap_start}:{gap_end}] scale={scale:.3f}")
+        return filled_vals * scale
+
+    def _compute_template_scale(
+        self,
+        df: pd.DataFrame,
+        site: str,
+        cal_start: int,
+        cal_end: int,
+    ) -> Optional[float]:
+        """Ratio of real data mean to template-prediction mean over the
+        `[cal_start, cal_end)` window. Returns None when fewer than 12
+        paired (real, template) points are available or when the predicted
+        mean is non-positive."""
+        if cal_end <= cal_start:
+            return None
+
+        actual = df.loc[cal_start:cal_end - 1, site].to_numpy(dtype=float)
+        hours = df.loc[cal_start:cal_end - 1, 'Hour'].values
+        days = df.loc[cal_start:cal_end - 1, 'DayOfWeek'].values
+
+        predicted = np.full(len(hours), np.nan)
+        site_templates = self._weekly_templates.get(site, {})
+        for i, (h, dn) in enumerate(zip(hours, days)):
+            tpl = site_templates.get(dn, {}).get(h)
+            if tpl is not None and tpl.get('median') is not None:
+                predicted[i] = tpl['median']
+
+        valid = ~np.isnan(actual) & ~np.isnan(predicted) & (predicted > 0)
+        if valid.sum() < 12:
+            return None
+
+        actual_mean = float(np.mean(actual[valid]))
+        predicted_mean = float(np.mean(predicted[valid]))
+        if predicted_mean <= 0:
+            return None
+
+        return float(np.clip(actual_mean / predicted_mean, 0.5, 2.0))
 
     def _validate_and_clip(self, values: np.ndarray, site: str, df: pd.DataFrame) -> np.ndarray:
         values = np.array(values, dtype=float)
