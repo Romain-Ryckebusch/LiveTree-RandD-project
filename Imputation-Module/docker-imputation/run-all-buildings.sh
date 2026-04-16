@@ -4,7 +4,8 @@
 #
 # Usage:
 #   CASSANDRA_HOSTS=10.64.253.14 ./run-all-buildings.sh [TARGET_DATE] \
-#     [--test-gap START END]... [--overlay-prior-week] [--overlay-actual]
+#     [--test-gap START END]... [--overlay-prior-week] [--overlay-actual] \
+#     [--no-clear]
 #
 # TARGET_DATE defaults to today (UTC). The 7-day window ending the day
 # before TARGET_DATE is what actually gets reconstructed.
@@ -22,12 +23,18 @@
 # measured values. In --test-gap mode this reveals the ground truth under the
 # synthetic gaps; in normal mode it is the raw input with real sensor gaps
 # left as breaks in the line.
+#
+# By default, this script clears prior reconstruction outputs (reconstructed*.csv,
+# reconstructed*.png, test_report_*.csv) from ./io/ before running, so the folder
+# only holds artifacts from the latest run. Pass --no-clear to preserve them,
+# e.g. when comparing a new run against a previous one. input*.csv and files
+# from other workflows are never touched.
 
 set -euo pipefail
 
 die() {
   echo "ERROR: $*" >&2
-  echo "Usage: $0 [TARGET_DATE] [--test-gap START END]... [--overlay-prior-week] [--overlay-actual]" >&2
+  echo "Usage: $0 [TARGET_DATE] [--test-gap START END]... [--overlay-prior-week] [--overlay-actual] [--no-clear]" >&2
   exit 1
 }
 
@@ -40,6 +47,7 @@ fi
 
 GAP_ARGS=()
 OVERLAY_ARGS=()
+CLEAR=true
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --test-gap)
@@ -53,6 +61,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --overlay-actual)
       OVERLAY_ARGS+=(--overlay-actual)
+      shift
+      ;;
+    --no-clear)
+      CLEAR=false
       shift
       ;;
     *)
@@ -69,6 +81,20 @@ if [[ ${#GAP_ARGS[@]} -gt 0 ]]; then
 fi
 
 BUILDINGS=(Ptot_HA Ptot_HEI_13RT Ptot_HEI_5RNS Ptot_RIZOMM Ptot_Campus)
+
+if $CLEAR; then
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  IO_DIR="${SCRIPT_DIR}/io"
+  echo "=== Clearing previous reconstruction outputs in ${IO_DIR} ==="
+  shopt -s nullglob
+  stale=( "${IO_DIR}"/reconstructed*.csv \
+          "${IO_DIR}"/reconstructed*.png \
+          "${IO_DIR}"/test_report_*.csv )
+  shopt -u nullglob
+  if (( ${#stale[@]} > 0 )); then
+    rm -f -- "${stale[@]}"
+  fi
+fi
 
 for B in "${BUILDINGS[@]}"; do
   echo "=== Reconstructing ${B} for ${TARGET_DATE} ==="
