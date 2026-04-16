@@ -6,11 +6,8 @@ services:
     image: rd-imputer:latest
     container_name: rd_imputer
     volumes:
-      # Historical + weather CSVs and the recent HA CSV (read-only)
       - ../../data:/data:ro
-      # Input/output exchange dir
       - ./io:/io
-      # Persistent cache for hybrid_templates_cache.pkl
       - ./cache:/app/cache
     environment:
       CASSANDRA_HOSTS: ${CASSANDRA_HOSTS:-cassandra-single-node}
