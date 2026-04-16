@@ -23,7 +23,19 @@ QUALITY_LABELS = {
 }
 
 
-def render(csv_path: str, png_path: str, building_column: str) -> None:
+def _to_paris_naive(ts):
+    t = pd.Timestamp(ts)
+    if t.tz is None:
+        return t
+    return t.tz_convert("Europe/Paris").tz_localize(None)
+
+
+def render(
+    csv_path: str,
+    png_path: str,
+    building_column: str,
+    masked_ranges=None,
+) -> None:
     df = pd.read_csv(csv_path)
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
     df["timestamp"] = df["timestamp"].dt.tz_convert("Europe/Paris").dt.tz_localize(None)
@@ -35,6 +47,13 @@ def render(csv_path: str, png_path: str, building_column: str) -> None:
     n_imputed = int(len(df) - n_real)
 
     fig, ax = plt.subplots(figsize=(14, 5))
+
+    if masked_ranges:
+        for raw_start, raw_end in masked_ranges:
+            s = _to_paris_naive(raw_start)
+            e = _to_paris_naive(raw_end)
+            ax.axvspan(s, e, color="0.85", alpha=0.4, zorder=0, label="_nolegend_")
+
     ax.plot(
         df["timestamp"], df["value"],
         color="0.7", linewidth=1.0, zorder=1, label="Reconstructed series",
@@ -61,7 +80,13 @@ def render(csv_path: str, png_path: str, building_column: str) -> None:
     ax.xaxis.set_minor_locator(mdates.HourLocator(byhour=range(0, 24, 6)))
     ax.grid(True, which="major", alpha=0.3)
     ax.grid(True, which="minor", alpha=0.1)
-    ax.legend(loc="upper right", fontsize=9)
+
+    handles, labels = ax.get_legend_handles_labels()
+    if masked_ranges:
+        from matplotlib.patches import Patch
+        handles.append(Patch(facecolor="0.85", alpha=0.4,
+                             label="Test-mode masked range"))
+    ax.legend(handles=handles, loc="upper right", fontsize=9)
 
     fig.autofmt_xdate()
     fig.tight_layout()

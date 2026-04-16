@@ -48,6 +48,46 @@ Credentials and keyspace are optional; see *Configuration via env vars*
 below. You can also keep them in a local `.env` next to `docker-compose.yml`
 (already allowed via `env_file: required: false`).
 
+### Test mode (reconstruction quality vs real data)
+
+To evaluate imputation quality against known-good data, add one or more
+`--test-gap START END` pairs. The script will virtually replace those rows
+with `NaN` **in memory** before imputation. The source (CSV file or
+Cassandra cluster) is never modified.
+
+```bash
+CASSANDRA_HOSTS=10.64.253.10 docker compose run --rm imputer \
+    --source cassandra --target-date 2026-04-16 --building Ptot_HEI_13RT \
+    --output /io/output.csv \
+    --test-gap "2026-04-14 08:00" "2026-04-14 14:00" \
+    --test-gap "2026-04-15 18:00" "2026-04-15 22:00" \
+    --test-report /io/test_report.csv \
+    --plot /io/plot.png
+```
+
+- Bounds are **naive Europe/Paris** local datetimes; the inclusive
+  `[START, END]` interval is compared against the 10-minute grid.
+- `--test-gap` is repeatable for multiple ranges.
+- `--test-report PATH` writes a CSV with the following schema (masked rows
+  only), plus summary metrics as `# key=value` footer lines and a one-line
+  `[TEST] ...` stdout summary:
+
+  | Column         | Notes                                                  |
+  |----------------|--------------------------------------------------------|
+  | `timestamp`    | Echoed from the input.                                 |
+  | `ground_truth` | Original pre-mask value (NaN if the source was NaN).   |
+  | `imputed`      | Reconstructed value returned by the engine.            |
+  | `quality`      | 0 = real (only possible when source was already NaN),  |
+  |                | 1/2/3 = linear / contextual / donor-day.               |
+  | `abs_error`    | `abs(imputed - ground_truth)`.                         |
+
+- When `--plot` is combined with `--test-gap`, each masked range is shaded
+  as a translucent grey band on the output PNG.
+- A range that is fully outside the 7-day window is a hard error; one that
+  is partially outside is clipped with a warning. Masking the entire window
+  is allowed only in Cassandra mode (where the 56-day history provides
+  context); in CSV mode it is a hard error.
+
 ## I/O contract
 
 ### CSV mode input (`/io/input.csv`)
