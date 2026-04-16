@@ -431,6 +431,16 @@ def main():
         ),
     )
     parser.add_argument(
+        "--overlay-actual", action="store_true",
+        help=(
+            "Overlay the actual (pre-imputation) measured values as a solid "
+            "black line on the plot. In --test-gap mode this reveals the "
+            "ground-truth values hidden under synthetic gaps; in normal mode "
+            "it is the raw Cassandra/CSV input with real sensor gaps left as "
+            "breaks in the line."
+        ),
+    )
+    parser.add_argument(
         "--seed", type=int, default=None,
         help="Optional random seed for deterministic imputation.",
     )
@@ -478,6 +488,10 @@ def main():
             include_prior_week=args.overlay_prior_week,
         )
         building_column = args.building
+
+    actual_values = None
+    if args.overlay_actual:
+        actual_values = df["value"].to_numpy(dtype=float).copy()
 
     gt_values = None
     test_mask = None
@@ -547,6 +561,7 @@ def main():
                 args.output, args.plot, building_column,
                 masked_ranges=test_gaps,
                 prior_week_values=prior_week_values,
+                actual_values=actual_values,
             )
         except Exception as exc:
             fail(f"plot_reconstruction.render() raised {type(exc).__name__}: {exc}")

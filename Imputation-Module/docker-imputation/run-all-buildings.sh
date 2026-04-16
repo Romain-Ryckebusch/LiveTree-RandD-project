@@ -4,7 +4,7 @@
 #
 # Usage:
 #   CASSANDRA_HOSTS=10.64.253.14 ./run-all-buildings.sh [TARGET_DATE] \
-#     [--test-gap START END]... [--overlay-prior-week]
+#     [--test-gap START END]... [--overlay-prior-week] [--overlay-actual]
 #
 # TARGET_DATE defaults to today (UTC). The 7-day window ending the day
 # before TARGET_DATE is what actually gets reconstructed.
@@ -17,12 +17,17 @@
 # --overlay-prior-week adds a dashed purple curve to each PNG showing the
 # 7 days preceding the reconstructed window (shifted +7 days), i.e. a naive
 # "copy last week" baseline for visually comparing against our algorithm.
+#
+# --overlay-actual adds a solid black curve showing the actual (pre-imputation)
+# measured values. In --test-gap mode this reveals the ground truth under the
+# synthetic gaps; in normal mode it is the raw input with real sensor gaps
+# left as breaks in the line.
 
 set -euo pipefail
 
 die() {
   echo "ERROR: $*" >&2
-  echo "Usage: $0 [TARGET_DATE] [--test-gap START END]... [--overlay-prior-week]" >&2
+  echo "Usage: $0 [TARGET_DATE] [--test-gap START END]... [--overlay-prior-week] [--overlay-actual]" >&2
   exit 1
 }
 
@@ -34,7 +39,7 @@ else
 fi
 
 GAP_ARGS=()
-OVERLAY_ARG=()
+OVERLAY_ARGS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --test-gap)
@@ -43,7 +48,11 @@ while [[ $# -gt 0 ]]; do
       shift 3
       ;;
     --overlay-prior-week)
-      OVERLAY_ARG=(--overlay-prior-week)
+      OVERLAY_ARGS+=(--overlay-prior-week)
+      shift
+      ;;
+    --overlay-actual)
+      OVERLAY_ARGS+=(--overlay-actual)
       shift
       ;;
     *)
@@ -77,8 +86,8 @@ for B in "${BUILDINGS[@]}"; do
     cmd_args+=(--test-report "/io/test_report_${B}_${TARGET_DATE}.csv")
   fi
 
-  if [[ ${#OVERLAY_ARG[@]} -gt 0 ]]; then
-    cmd_args+=("${OVERLAY_ARG[@]}")
+  if [[ ${#OVERLAY_ARGS[@]} -gt 0 ]]; then
+    cmd_args+=("${OVERLAY_ARGS[@]}")
   fi
 
   docker compose run --rm imputer "${cmd_args[@]}"

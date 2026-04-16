@@ -36,6 +36,7 @@ def render(
     building_column: str,
     masked_ranges=None,
     prior_week_values=None,
+    actual_values=None,
 ) -> None:
     df = pd.read_csv(csv_path)
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
@@ -68,6 +69,16 @@ def render(
             df["timestamp"], prior_week_values,
             color="tab:purple", linestyle="--", linewidth=1.2, alpha=0.7,
             zorder=1, label="Previous week (naive baseline)",
+        )
+    if actual_values is not None:
+        assert len(actual_values) == len(df), (
+            f"actual_values length {len(actual_values)} != "
+            f"reconstructed window length {len(df)}"
+        )
+        ax.plot(
+            df["timestamp"], actual_values,
+            color="black", linewidth=1.0, alpha=0.7,
+            zorder=1.5, label="Actual measurement",
         )
     for flag, (label, color) in QUALITY_LABELS.items():
         mask = df["quality"] == flag
