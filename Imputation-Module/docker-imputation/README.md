@@ -15,14 +15,44 @@ The compose file's build context is the project root, so the Dockerfile can
 `COPY` from `Imputation-Module/src/`. First build is 3-5 minutes; subsequent
 builds reuse the pip layer.
 
+## Daemon mode (default)
+
+`docker compose up -d` launches a long-running scheduler. Every day at **23:50
+Europe/Paris** it imputes all five buildings for the next day's prediction:
+
+- `TARGET_DATE` is computed as tomorrow in Europe/Paris (so a run at 23:50 on
+  2026-04-22 feeds the 2026-04-23 forecast).
+- The 7-day Cassandra window ending at 23:50 of the current day is pulled and
+  reconstructed once per building in `config.BUILDINGS`.
+- Before each batch, previous `reconstructed_*.csv` files are wiped from
+  `/io/` so only the latest run remains on disk. Audit logs under
+  `/io/audit_logs/` are preserved.
+- Outputs land at `./io/reconstructed_<building>_<target_date>.csv`.
+- A failure on one building is logged to stdout and the batch continues with
+  the next. The container keeps running thanks to
+  `restart: unless-stopped`.
+
+Logs stream on `docker compose logs -f imputer`.
+
+The fire time is configurable via env vars (defaults shown):
+
+- `SCHEDULE_HOUR=23` (0-23)
+- `SCHEDULE_MINUTE=50` (0-59)
+
+Set them in a `.env` next to `docker-compose.yml`, or override on the command
+line: `SCHEDULE_HOUR=2 SCHEDULE_MINUTE=0 docker compose up -d`.
+
 ## Run
+
+For ad-hoc / test runs, override the default command and name the script
+explicitly (the entrypoint is plain `python`):
 
 ### CSV mode
 
 Put your input at `./io/input.csv`, then:
 
 ```bash
-docker compose run --rm imputer --source csv --input /io/input.csv --output /io/output.csv --seed 42
+docker compose run --rm imputer impute_cli.py --source csv --input /io/input.csv --output /io/output.csv --seed 42
 ```
 
 On success: `[OK] Imputed N gap point(s) -> /io/output.csv` and exit 0.
@@ -35,7 +65,7 @@ Point the container at a reachable cluster and name the target date. The
 
 ```bash
 CASSANDRA_HOSTS=10.64.253.10,10.64.253.11,10.64.253.12 \
-  docker compose run --rm imputer \
+  docker compose run --rm imputer impute_cli.py \
     --source cassandra \
     --target-date 2026-04-10 \
     --output /io/output.csv
@@ -51,7 +81,7 @@ more `--test-gap START END` pairs. Those rows are replaced with NaN *in memory*
 before imputation; the source (CSV file or Cassandra cluster) is never modified.
 
 ```bash
-CASSANDRA_HOSTS=10.64.253.10 docker compose run --rm imputer \
+CASSANDRA_HOSTS=10.64.253.10 docker compose run --rm imputer impute_cli.py \
     --source cassandra --target-date 2026-04-16 --building Ptot_HEI_13RT \
     --output /io/output.csv \
     --test-gap "2026-04-14 08:00" "2026-04-14 14:00" \

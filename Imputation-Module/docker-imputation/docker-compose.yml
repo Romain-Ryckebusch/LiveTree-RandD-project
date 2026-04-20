@@ -14,12 +14,15 @@ services:
       CASSANDRA_USERNAME: ${CASSANDRA_USERNAME:-}
       CASSANDRA_PASSWORD: ${CASSANDRA_PASSWORD:-}
       CASSANDRA_KEYSPACE: ${CASSANDRA_KEYSPACE:-previsions_data}
+      TZ: Europe/Paris
+      SCHEDULE_HOUR: ${SCHEDULE_HOUR:-23}
+      SCHEDULE_MINUTE: ${SCHEDULE_MINUTE:-50}
     env_file:
       - path: .env
         required: false
     networks:
       - cassandra_net
-    command: ["--source", "csv", "--input", "/io/input.csv", "--output", "/io/output.csv"]
+    restart: unless-stopped
 
 networks:
   cassandra_net:

@@ -7,4 +7,5 @@ joblib==0.16.0
 pykalman==0.9.5
 cassandra-driver==3.24.0
 matplotlib==3.3.4
+APScheduler==3.6.3
 

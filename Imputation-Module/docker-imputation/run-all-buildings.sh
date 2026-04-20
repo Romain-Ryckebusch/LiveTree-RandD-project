@@ -114,7 +114,7 @@ for B in "${BUILDINGS[@]}"; do
     cmd_args+=("${OVERLAY_ARGS[@]}")
   fi
 
-  docker compose run --rm imputer "${cmd_args[@]}"
+  docker compose run --rm imputer impute_cli.py "${cmd_args[@]}"
 done
 
 if $TEST_MODE; then

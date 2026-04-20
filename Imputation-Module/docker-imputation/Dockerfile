@@ -20,5 +20,5 @@ ENV PYTHONUNBUFFERED=1 \
     IMPUTER_OUTPUT_DIR=/app/cache \
     IMPUTER_AUDIT_LOG_DIR=/io/audit_logs
 
-ENTRYPOINT ["python", "impute_cli.py"]
-CMD ["--help"]
+ENTRYPOINT ["python"]
+CMD ["scheduler.py"]
