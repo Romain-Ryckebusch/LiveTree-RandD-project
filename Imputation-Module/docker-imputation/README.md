@@ -42,6 +42,32 @@ The fire time is configurable via env vars (defaults shown):
 Set them in a `.env` next to `docker-compose.yml`, or override on the command
 line: `SCHEDULE_HOUR=2 SCHEDULE_MINUTE=0 docker compose up -d`.
 
+## Manual trigger
+
+To run the same batch on demand (instead of waiting for 23:50) without
+shutting down the daemon, spin up a fresh ephemeral container with
+`--run-now`:
+
+```bash
+CASSANDRA_HOSTS=10.64.253.10,10.64.253.11,10.64.253.12 \
+  docker compose run --rm imputer scheduler.py --run-now --with-plots
+```
+
+- `--run-now` executes the full per-building batch once and exits. No cron,
+  no daemon loop. Exit code is non-zero if any building failed.
+- `--with-plots` adds a `--plot /io/reconstructed_<building>_<target>.png`
+  to each call so PNG overlays land next to the CSVs. Omit it for CSV-only.
+- Target date is still "tomorrow in Europe/Paris" — same semantics as the
+  nightly cron. Use `run-all-buildings.sh` below if you need a custom date
+  or debug overlays.
+- The daemon container started by `docker compose up -d` is untouched;
+  `docker compose run` creates a sibling container.
+
+For the richer debug workflow (custom `TARGET_DATE`, `--test-gap`,
+`--overlay-prior-week`, `--overlay-actual`, `--no-clear`), use
+`./run-all-buildings.sh`, which bypasses the scheduler and calls
+`impute_cli.py` per building directly.
+
 ## Run
 
 For ad-hoc / test runs, override the default command and name the script
