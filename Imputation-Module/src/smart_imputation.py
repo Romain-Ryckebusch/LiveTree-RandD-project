@@ -1656,6 +1656,20 @@ class ExtendedDeploymentAlgorithm:
             return df
         weather = self.weather_df.copy()
         weather['Timestamp'] = pd.to_datetime(weather['Timestamp'])
+
+        # Align weather tz to df tz; merge keys must have matching dtypes.
+        df_tz = df['Timestamp'].dt.tz
+        w_tz = weather['Timestamp'].dt.tz
+        if df_tz is None and w_tz is not None:
+            weather['Timestamp'] = weather['Timestamp'].dt.tz_convert(
+                self.timezone).dt.tz_localize(None)
+        elif df_tz is not None and w_tz is None:
+            weather['Timestamp'] = weather['Timestamp'].dt.tz_localize(
+                self.timezone, ambiguous=False, nonexistent='shift_forward'
+            ).dt.tz_convert(df_tz)
+        elif df_tz is not None and w_tz is not None and str(w_tz) != str(df_tz):
+            weather['Timestamp'] = weather['Timestamp'].dt.tz_convert(df_tz)
+
         df = df.merge(weather[['Timestamp', 'AirTemp']], on='Timestamp', how='left')
         if 'AirTemp' in df.columns:
             df['AirTemp'] = df['AirTemp'].ffill().bfill()
