@@ -79,12 +79,15 @@ def run_daily_imputation(
     with_plots: bool = False,
     overlay_prior_week: bool = False,
     overlay_actual: bool = False,
+    test_gaps: list | None = None,
 ) -> list:
     target_date = _tomorrow_iso()
     log.info(
         "=== Daily imputation run for target_date=%s "
-        "(with_plots=%s overlay_prior_week=%s overlay_actual=%s) ===",
+        "(with_plots=%s overlay_prior_week=%s overlay_actual=%s "
+        "test_gaps=%s) ===",
         target_date, with_plots, overlay_prior_week, overlay_actual,
+        test_gaps or "none",
     )
 
     _wipe_previous_outputs()
@@ -109,6 +112,14 @@ def run_daily_imputation(
             cmd.append("--overlay-prior-week")
         if overlay_actual:
             cmd.append("--overlay-actual")
+        if test_gaps:
+            report_path = os.path.join(
+                IO_DIR,
+                f"reconstructed_{building}_{target_date}_test_report.csv",
+            )
+            for start, end in test_gaps:
+                cmd.extend(["--test-gap", start, end])
+            cmd.extend(["--test-report", report_path])
         log.info("Running: %s", " ".join(cmd))
         try:
             result = subprocess.run(
@@ -175,6 +186,19 @@ def _parse_args() -> argparse.Namespace:
             "Only meaningful with --with-plots."
         ),
     )
+    parser.add_argument(
+        "--test-gap", nargs=2, metavar=("START", "END"),
+        action="append", default=None,
+        help=(
+            "Test mode: mask rows in [START, END] (inclusive) with NaN "
+            "in memory before imputation, for every building in the "
+            "batch. START/END are naive Europe/Paris datetimes, e.g. "
+            "'2026-04-18 00:00'. Repeatable. The Cassandra source is "
+            "never modified. When set, a per-building test report CSV "
+            "with ground-truth / imputed / MAE / RMSE is written as "
+            "/io/reconstructed_<building>_<target_date>_test_report.csv."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -185,6 +209,7 @@ def main() -> None:
         with_plots=args.with_plots,
         overlay_prior_week=args.overlay_prior_week,
         overlay_actual=args.overlay_actual,
+        test_gaps=args.test_gap,
     )
 
     if args.run_now:
