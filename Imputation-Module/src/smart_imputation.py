@@ -1625,11 +1625,22 @@ class ExtendedDeploymentAlgorithm:
 
     def _anchor_to_boundaries(self, df, site, gap_start, gap_end, filled_vals, tpl_fn=None):
         """
-        Shift `filled_vals` so they meet the observed series at both edges.
+        Shift `filled_vals` so they meet the observed series at both edges,
+        then pull the values near each edge toward a linear y_L -> y_R
+        baseline so the template's local shape cannot produce a visible
+        discontinuity a few steps in from the boundary.
+
         Residual at left edge  = y(gap_start-1) - tpl(gap_start-1).
         Residual at right edge = y(gap_end)     - tpl(gap_end).
-        A linear blend of the two residuals is added across the gap, so the
-        curve lands exactly on the neighbours at both ends.
+
+        Step 1: add a linear blend of the two residuals to shift the template
+                level so it lands on y_L at gap_start-1 and y_R at gap_end.
+        Step 2: if both endpoints are observed, blend the anchored template
+                with a pure linear y_L -> y_R interpolation. The blend weight
+                is boundary-heavy (exponential with length `tau`) so the
+                first/last ~tau steps are dominated by the linear baseline
+                (no template shape leaking through), and the interior is
+                dominated by the anchored template (daily shape preserved).
 
         `tpl_fn(idx) -> float` returns the template value at row `idx`. If
         None, falls back to the weekly-template lookup used by
@@ -1665,7 +1676,18 @@ class ExtendedDeploymentAlgorithm:
             dR = dL
 
         alpha = (np.arange(n) + 1) / (n + 1)
-        return filled_vals + (1 - alpha) * dL + alpha * dR
+        anchored = filled_vals + (1 - alpha) * dL + alpha * dR
+
+        if np.isfinite(y_L) and np.isfinite(y_R):
+            baseline = y_L + alpha * (y_R - y_L)
+            # ~1h (6 samples) minimum; scales up for very long gaps but capped
+            # so the interior still shows template shape on multi-hour gaps.
+            tau = max(6.0, min(36.0, n / 12.0))
+            i = np.arange(n, dtype=float)
+            w = np.maximum(np.exp(-i / tau), np.exp(-(n - 1 - i) / tau))
+            return w * baseline + (1 - w) * anchored
+
+        return anchored
 
     def _validate_and_clip(self, values: np.ndarray, site: str, df: pd.DataFrame) -> np.ndarray:
         values = np.array(values, dtype=float)
