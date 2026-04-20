@@ -49,7 +49,6 @@ shutting down the daemon, spin up a fresh ephemeral container with
 `--run-now`:
 
 ```bash
-CASSANDRA_HOSTS=10.64.253.10,10.64.253.11,10.64.253.12 \
   docker compose run --rm imputer scheduler.py --run-now --with-plots
 ```
 
@@ -57,16 +56,26 @@ CASSANDRA_HOSTS=10.64.253.10,10.64.253.11,10.64.253.12 \
   no daemon loop. Exit code is non-zero if any building failed.
 - `--with-plots` adds a `--plot /io/reconstructed_<building>_<target>.png`
   to each call so PNG overlays land next to the CSVs. Omit it for CSV-only.
+- `--overlay-prior-week` adds the dashed "copy last week" baseline to each
+  plot (forwarded to `impute_cli.py`). Only meaningful with `--with-plots`.
+- `--overlay-actual` adds the solid pre-imputation measured curve. Only
+  meaningful with `--with-plots`.
 - Target date is still "tomorrow in Europe/Paris" — same semantics as the
   nightly cron. Use `run-all-buildings.sh` below if you need a custom date
-  or debug overlays.
+  or test-gap mode.
 - The daemon container started by `docker compose up -d` is untouched;
   `docker compose run` creates a sibling container.
 
-For the richer debug workflow (custom `TARGET_DATE`, `--test-gap`,
-`--overlay-prior-week`, `--overlay-actual`, `--no-clear`), use
-`./run-all-buildings.sh`, which bypasses the scheduler and calls
-`impute_cli.py` per building directly.
+Example with the last-week baseline on every plot:
+
+```bash
+  docker compose run --rm imputer scheduler.py \
+    --run-now --with-plots --overlay-prior-week --overlay-actual
+```
+
+For the debug workflow that needs a custom `TARGET_DATE`, `--test-gap`, or
+`--no-clear`, use `./run-all-buildings.sh` instead, which bypasses the
+scheduler and calls `impute_cli.py` per building directly.
 
 ## Run
 
