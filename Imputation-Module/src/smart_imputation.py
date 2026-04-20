@@ -1043,11 +1043,24 @@ class ExtendedDeploymentAlgorithm:
             ]
             log.info(f"[CHUNKED] {site}: {gap_size} steps → {n} chunks")
 
+        used_multi_week = False
         for chunk_idx, (cs, ce) in enumerate(chunks):
             if self.use_multi_week_templates and self._weekly_templates:
-                self._fill_with_multi_week_template(df, site, cs, ce, chunk_index=chunk_idx)
+                # Skip per-chunk anchoring: the intermediate chunk boundaries
+                # inside the gap are still NaN when each chunk runs, so
+                # per-chunk anchoring would collapse to dR = dL and paste a
+                # constant offset. Anchor once across the whole gap below.
+                self._fill_with_multi_week_template(
+                    df, site, cs, ce, chunk_index=chunk_idx, anchor=False)
+                used_multi_week = True
             else:
                 self._intelligent_router(df, site, cs, ce, chunk_index=chunk_idx)
+
+        if used_multi_week:
+            filled = df.loc[gap_start:gap_end - 1, site].values.astype(float)
+            filled = self._anchor_to_boundaries(df, site, gap_start, gap_end, filled)
+            filled = self._validate_and_clip(filled, site, df)
+            df.loc[gap_start:gap_end - 1, site] = filled
 
     # ─────────────────────────────────────────────────────────────────────────
     # Smart chunking
@@ -1178,7 +1191,7 @@ class ExtendedDeploymentAlgorithm:
 
     def _fill_with_multi_week_template(
         self, df: pd.DataFrame, site: str, gap_start: int, gap_end: int,
-        chunk_index: Optional[int] = None,
+        chunk_index: Optional[int] = None, anchor: bool = True,
     ):
         routing_trace = ['MULTI_WEEK_TEMPLATE_LOOKUP']
         try:
@@ -1205,7 +1218,8 @@ class ExtendedDeploymentAlgorithm:
                         confidences.append(0.0)
 
             filled_vals = np.array(filled_vals, dtype=float)
-            filled_vals = self._anchor_to_boundaries(df, site, gap_start, gap_end, filled_vals)
+            if anchor:
+                filled_vals = self._anchor_to_boundaries(df, site, gap_start, gap_end, filled_vals)
             filled_vals = self._validate_and_clip(filled_vals, site, df)
             df.loc[gap_start:gap_end - 1, site] = filled_vals
 
