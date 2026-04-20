@@ -1630,8 +1630,18 @@ class ExtendedDeploymentAlgorithm:
         baseline so the template's local shape cannot produce a visible
         discontinuity a few steps in from the boundary.
 
-        Residual at left edge  = y(gap_start-1) - tpl(gap_start-1).
-        Residual at right edge = y(gap_end)     - tpl(gap_end).
+        Residuals are computed as the median of (y - tpl) over a ~1h window
+        on each side of the gap, NOT as a single-point difference. The
+        single-point form `dL = y(gap_start-1) - tpl(gap_start-1)` conflated
+        two things:
+          (a) the true observation-vs-template residual we want to propagate;
+          (b) the *step* in the per-(day, hour) template between the last
+              pre-gap step and the first in-gap step (e.g., Fri-23h vs
+              Sat-00h in a per-day-of-week template).
+        Effect (b) would leak into dL and produce a visible dip a few hours
+        into the gap once the exponential boundary blend fades. Averaging
+        over ~6 samples on a single side of the boundary stays inside one
+        (day, hour) regime and also damps single-point observation noise.
 
         Step 1: add a linear blend of the two residuals to shift the template
                 level so it lands on y_L at gap_start-1 and y_R at gap_end.
@@ -1660,13 +1670,45 @@ class ExtendedDeploymentAlgorithm:
 
         tpl = tpl_fn if tpl_fn is not None else _default_tpl
 
+        # ~1h at 10-min cadence; small enough to stay inside one
+        # (day_of_week, hour) regime, large enough to damp per-point noise.
+        ANCHOR_WINDOW = 6
+
+        def _windowed_residual(lo: int, hi: int) -> float:
+            lo = max(0, min(len(df), lo))
+            hi = max(0, min(len(df), hi))
+            if hi <= lo:
+                return np.nan
+            residuals = []
+            for k in range(lo, hi):
+                y_k = df.loc[k, site]
+                if not np.isfinite(y_k):
+                    continue
+                t_k = tpl(k)
+                if not np.isfinite(t_k):
+                    continue
+                residuals.append(y_k - t_k)
+            return float(np.median(residuals)) if residuals else np.nan
+
         y_L = df.loc[gap_start - 1, site] if gap_start > 0        else np.nan
         y_R = df.loc[gap_end,        site] if gap_end   < len(df) else np.nan
-        t_L = tpl(gap_start - 1)          if gap_start > 0        else np.nan
-        t_R = tpl(gap_end)                if gap_end   < len(df) else np.nan
 
-        dL = y_L - t_L if np.isfinite(y_L) and np.isfinite(t_L) else np.nan
-        dR = y_R - t_R if np.isfinite(y_R) and np.isfinite(t_R) else np.nan
+        # Windowed residuals (robust). Each window is entirely on one side
+        # of the gap boundary, so it cannot pick up the template step
+        # across the boundary.
+        dL = _windowed_residual(gap_start - ANCHOR_WINDOW, gap_start)
+        dR = _windowed_residual(gap_end, gap_end + ANCHOR_WINDOW)
+
+        # Single-point fallback (preserves v1 behaviour) when the window has
+        # no usable data - e.g. the gap is flanked by other gaps.
+        if not np.isfinite(dL) and gap_start > 0:
+            t_L = tpl(gap_start - 1)
+            if np.isfinite(y_L) and np.isfinite(t_L):
+                dL = y_L - t_L
+        if not np.isfinite(dR) and gap_end < len(df):
+            t_R = tpl(gap_end)
+            if np.isfinite(y_R) and np.isfinite(t_R):
+                dR = y_R - t_R
 
         if not np.isfinite(dL) and not np.isfinite(dR):
             return filled_vals
