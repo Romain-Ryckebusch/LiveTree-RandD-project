@@ -1204,7 +1204,9 @@ class ExtendedDeploymentAlgorithm:
                         filled_vals.append(np.nan)
                         confidences.append(0.0)
 
-            filled_vals = self._validate_and_clip(np.array(filled_vals), site, df)
+            filled_vals = np.array(filled_vals, dtype=float)
+            filled_vals = self._anchor_to_boundaries(df, site, gap_start, gap_end, filled_vals)
+            filled_vals = self._validate_and_clip(filled_vals, site, df)
             df.loc[gap_start:gap_end - 1, site] = filled_vals
 
             avg_conf = float(np.nanmean(confidences))
@@ -1484,8 +1486,16 @@ class ExtendedDeploymentAlgorithm:
                 self._fill_safe_median_template(df, site, gap_start, gap_end)
                 return
             hours = df.loc[gap_start:gap_end - 1, 'Hour'].values
-            vals = self._validate_and_clip(
-                np.array([tmpl.get(h, np.nan) for h in hours]), site, df)
+            vals = np.array([tmpl.get(h, np.nan) for h in hours], dtype=float)
+
+            def _tpl(idx):
+                if idx < 0 or idx >= len(df):
+                    return np.nan
+                v = tmpl.get(df.loc[idx, 'Hour'])
+                return float(v) if v is not None and np.isfinite(v) else np.nan
+
+            vals = self._anchor_to_boundaries(df, site, gap_start, gap_end, vals, tpl_fn=_tpl)
+            vals = self._validate_and_clip(vals, site, df)
             df.loc[gap_start:gap_end - 1, site] = vals
         except Exception as e:
             log.error(f"[ERROR] _fill_weekend_template ({site}): {e}")
@@ -1498,7 +1508,17 @@ class ExtendedDeploymentAlgorithm:
             for h in hours:
                 mask = (df['Hour'] == h) & df[site].notna()
                 vals.append(float(df.loc[mask, site].median()) if mask.any() else np.nan)
-            df.loc[gap_start:gap_end - 1, site] = self._validate_and_clip(np.array(vals), site, df)
+            vals = np.array(vals, dtype=float)
+
+            def _tpl(idx):
+                if idx < 0 or idx >= len(df):
+                    return np.nan
+                h = df.loc[idx, 'Hour']
+                mask = (df['Hour'] == h) & df[site].notna()
+                return float(df.loc[mask, site].median()) if mask.any() else np.nan
+
+            vals = self._anchor_to_boundaries(df, site, gap_start, gap_end, vals, tpl_fn=_tpl)
+            df.loc[gap_start:gap_end - 1, site] = self._validate_and_clip(vals, site, df)
         except Exception as e:
             log.error(f"[ERROR] _fill_with_thermal_template ({site}): {e}")
             self._fill_safe_median_template(df, site, gap_start, gap_end)
@@ -1588,6 +1608,50 @@ class ExtendedDeploymentAlgorithm:
     # ─────────────────────────────────────────────────────────────────────────
     # Validation, cleanup, smoothing
     # ─────────────────────────────────────────────────────────────────────────
+
+    def _anchor_to_boundaries(self, df, site, gap_start, gap_end, filled_vals, tpl_fn=None):
+        """
+        Shift `filled_vals` so they meet the observed series at both edges.
+        Residual at left edge  = y(gap_start-1) - tpl(gap_start-1).
+        Residual at right edge = y(gap_end)     - tpl(gap_end).
+        A linear blend of the two residuals is added across the gap, so the
+        curve lands exactly on the neighbours at both ends.
+
+        `tpl_fn(idx) -> float` returns the template value at row `idx`. If
+        None, falls back to the weekly-template lookup used by
+        _fill_with_multi_week_template.
+        """
+        n = len(filled_vals)
+        if n == 0:
+            return filled_vals
+
+        def _default_tpl(idx):
+            if idx < 0 or idx >= len(df):
+                return np.nan
+            day = df.loc[idx, 'DayOfWeek']
+            hour = df.loc[idx, 'Hour']
+            t = self._weekly_templates.get(site, {}).get(day, {}).get(hour)
+            return float(t['median']) if t is not None else np.nan
+
+        tpl = tpl_fn if tpl_fn is not None else _default_tpl
+
+        y_L = df.loc[gap_start - 1, site] if gap_start > 0        else np.nan
+        y_R = df.loc[gap_end,        site] if gap_end   < len(df) else np.nan
+        t_L = tpl(gap_start - 1)          if gap_start > 0        else np.nan
+        t_R = tpl(gap_end)                if gap_end   < len(df) else np.nan
+
+        dL = y_L - t_L if np.isfinite(y_L) and np.isfinite(t_L) else np.nan
+        dR = y_R - t_R if np.isfinite(y_R) and np.isfinite(t_R) else np.nan
+
+        if not np.isfinite(dL) and not np.isfinite(dR):
+            return filled_vals
+        if not np.isfinite(dL):
+            dL = dR
+        if not np.isfinite(dR):
+            dR = dL
+
+        alpha = (np.arange(n) + 1) / (n + 1)
+        return filled_vals + (1 - alpha) * dL + alpha * dR
 
     def _validate_and_clip(self, values: np.ndarray, site: str, df: pd.DataFrame) -> np.ndarray:
         values = np.array(values, dtype=float)
