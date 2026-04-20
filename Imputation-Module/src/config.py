@@ -52,3 +52,8 @@ OUTPUT_DIR = os.environ.get(
     "IMPUTER_OUTPUT_DIR",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "output"),
 )
+
+AUDIT_LOG_DIR = os.environ.get(
+    "IMPUTER_AUDIT_LOG_DIR",
+    os.path.join(OUTPUT_DIR, "audit_logs"),
+)

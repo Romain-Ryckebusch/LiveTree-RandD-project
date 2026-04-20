@@ -11,13 +11,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY ["Imputation-Module/src/", "/app/pkg/"]
 
-RUN mkdir -p /app/cache /io /data
+RUN mkdir -p /app/cache /io /io/audit_logs /data
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app/pkg \
     IMPUTER_DATA_DIR=/data \
     IMPUTER_RECENT_HA_CSV="/data/Cons_Hotel Academic_2026-03-22_2026-04-10.csv" \
-    IMPUTER_OUTPUT_DIR=/app/cache
+    IMPUTER_OUTPUT_DIR=/app/cache \
+    IMPUTER_AUDIT_LOG_DIR=/io/audit_logs
 
 ENTRYPOINT ["python", "impute_cli.py"]
 CMD ["--help"]

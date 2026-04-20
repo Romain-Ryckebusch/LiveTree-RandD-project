@@ -1,4 +1,4 @@
-"""Thin wrapper around TemperatureAwareHybridEngine for single-series use."""
+"""Single-series adapter around ExtendedDeploymentAlgorithm."""
 import contextlib
 import io
 import os
@@ -8,16 +8,15 @@ import numpy as np
 import pandas as pd
 
 from config import (
+    AUDIT_LOG_DIR,
     BUILDING_COLUMN,
     HISTORICAL_CSV,
-    LOW_VARIANCE_AUTO_FRACTION,
-    LOW_VARIANCE_FLOOR_W,
     OUTPUT_DIR,
     RECENT_HA_CSV,
     TIMEZONE,
     WEATHER_CSV,
 )
-from hybrid_engine import TemperatureAwareHybridEngine
+from smart_imputation import ExtendedDeploymentAlgorithm
 
 
 def _to_window_time(ts: pd.Series) -> pd.Series:
@@ -27,7 +26,6 @@ def _to_window_time(ts: pd.Series) -> pd.Series:
     return ts.dt.tz_convert(TIMEZONE).dt.tz_localize(None)
 
 
-_ENGINE: Dict[str, TemperatureAwareHybridEngine] = {}
 _WEATHER: Optional[pd.DataFrame] = None
 _HISTORY_CACHE: Dict[str, pd.DataFrame] = {}
 _LAST_STRATEGY_LOG: list = []
@@ -46,37 +44,40 @@ def set_history_source(df: Optional[pd.DataFrame], building_column: str) -> None
         _HISTORY_CACHE[building_column] = pd.DataFrame(
             columns=["Timestamp", building_column]
         )
-    else:
-        cleaned = df[["Timestamp", building_column]].copy()
-        cleaned["Timestamp"] = _to_window_time(cleaned["Timestamp"])
-        cleaned = (
-            cleaned.dropna(subset=["Timestamp"])
-            .drop_duplicates(subset=["Timestamp"], keep="last")
-            .sort_values("Timestamp")
-            .reset_index(drop=True)
-        )
-        _HISTORY_CACHE[building_column] = cleaned
-    # Force engine rebuild so the new history gets picked up.
-    _ENGINE.pop(building_column, None)
+        return
+    cleaned = df[["Timestamp", building_column]].copy()
+    cleaned["Timestamp"] = _to_window_time(cleaned["Timestamp"])
+    cleaned = (
+        cleaned.dropna(subset=["Timestamp"])
+        .drop_duplicates(subset=["Timestamp"], keep="last")
+        .sort_values("Timestamp")
+        .reset_index(drop=True)
+    )
+    _HISTORY_CACHE[building_column] = cleaned
 
 
 # 8 weeks: the long-gap ensemble needs this much context before its
 # >40%-missing fallback stops kicking in.
 _PREPEND_DAYS = 56
 
-# Maps TemperatureAwareHybridEngine strategy codes to CLI quality flags.
-# 1 = linear, 2 = contextual, 3 = donor-day.
+# Internal strategy names -> CLI quality flags.
+# 1 = linear, 2 = contextual, 3 = donor-day / ML-derived.
 _STRATEGY_FLAG_MAP = {
     "LINEAR_MICRO": 1,
     "LINEAR_SHORT": 1,
     "THERMAL_TEMPLATE": 2,
     "ENHANCED_TEMPLATE": 2,
+    "WEEKEND_TEMPLATE": 2,
     "WEEKEND_TEMPLATE_SATURDAY": 2,
     "WEEKEND_TEMPLATE_SUNDAY": 2,
     "WEEKEND_TEMPLATE_MIXED": 2,
     "SAFE_LINEAR_MEDIAN": 2,
     "PEER_CORRELATION": 2,
+    "HOURLY_MEDIAN_FALLBACK": 2,
     "MULTI_WEEK_TEMPLATE": 3,
+    "MICE": 3,
+    "KNN_CONTEXT": 3,
+    "KALMAN_FILTER": 3,
     "SAFE_MEDIAN": 3,
 }
 
@@ -145,40 +146,6 @@ def _extend_with_history(df_in: pd.DataFrame, building_column: str) -> pd.DataFr
     )
 
 
-def _auto_low_variance_threshold(hist: pd.DataFrame, building_column: str) -> float:
-    if hist.empty or building_column not in hist.columns:
-        return 5000.0
-    values = pd.to_numeric(hist[building_column], errors="coerce").to_numpy()
-    median_abs = float(np.nanmedian(np.abs(values)))
-    if not np.isfinite(median_abs) or median_abs <= 0:
-        return 5000.0
-    return max(LOW_VARIANCE_AUTO_FRACTION * median_abs, LOW_VARIANCE_FLOOR_W)
-
-
-def _get_engine(building_column: str) -> TemperatureAwareHybridEngine:
-    if building_column in _ENGINE:
-        return _ENGINE[building_column]
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    cache_path = os.path.join(
-        OUTPUT_DIR, f"hybrid_templates_cache_{building_column}.pkl"
-    )
-    hist = _load_combined_history(building_column)
-    low_var = _auto_low_variance_threshold(hist, building_column)
-    with contextlib.redirect_stdout(io.StringIO()):
-        engine = TemperatureAwareHybridEngine(
-            site_cols=[building_column],
-            weather_df=None,
-            use_historical_data=False,  # the 2021-2025 path doesn't exist here
-            template_cache_file=cache_path,
-            low_variance_threshold=low_var,
-        )
-    if not hist.empty:
-        engine.use_historical_data = True
-        engine.historical_df = hist
-    _ENGINE[building_column] = engine
-    return engine
-
-
 def _get_weather_df() -> pd.DataFrame:
     global _WEATHER
     if _WEATHER is None:
@@ -203,7 +170,7 @@ def impute(
     building_column: Optional[str] = None,
     **_kwargs,
 ):
-    """Impute a single series. Routes through TemperatureAwareHybridEngine."""
+    """Impute a single series. Routes through ExtendedDeploymentAlgorithm."""
     bcol = building_column or BUILDING_COLUMN
     s = pd.Series(series).reset_index(drop=True)
     if isinstance(date_index, pd.DatetimeIndex):
@@ -224,20 +191,39 @@ def impute(
 
     df_in = _extend_with_history(df_window, bcol)
     window_start_ts = pd.Timestamp(dt_naive.iloc[0])
-    # Engine reindexes to a 10-min grid floored on min(Timestamp), so the
-    # strategy-log offset has to use the floored value too.
+    # The algorithm reindexes to a 10-min grid floored on min(Timestamp), so
+    # the strategy-log offset has to use the floored value too.
     extension_start_ts = df_in["Timestamp"].min().floor("10min")
     extension_len = int(
         (window_start_ts - extension_start_ts) / pd.Timedelta(minutes=10)
     )
 
-    engine = _get_engine(bcol)
+    if random_seed is not None:
+        np.random.seed(random_seed)
+
+    os.makedirs(AUDIT_LOG_DIR, exist_ok=True)
+    algo = ExtendedDeploymentAlgorithm(
+        site_cols=[bcol],
+        use_knn=False,
+        use_mice=True,
+        use_kalman=True,
+        use_multi_week_templates=True,
+        use_chunked_recovery=True,
+        template_lookback_days=28,
+        audit_log_dir=AUDIT_LOG_DIR,
+        timezone=TIMEZONE,
+    )
+
     weather = _get_weather_df()
     weather_arg = weather if not weather.empty else None
 
-    with contextlib.redirect_stdout(io.StringIO()):
-        out_df = engine.impute(df_in, weather_df=weather_arg)
-    strategy_log = list(engine.strategy_log)
+    silent = io.StringIO()
+    with contextlib.redirect_stdout(silent), contextlib.redirect_stderr(silent):
+        out_df = algo.impute(df_in, weather_df=weather_arg)
+    strategy_log = list(algo.strategy_log)
+
+    if getattr(out_df["Timestamp"].dt, "tz", None) is not None:
+        out_df["Timestamp"] = out_df["Timestamp"].dt.tz_localize(None)
 
     out_df = (
         out_df.set_index("Timestamp")
