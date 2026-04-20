@@ -48,6 +48,19 @@ CONSO_PARTITION_KEY = "Conso_Data"
 METEO_TABLE = "pv_prev_meteo_clean"
 METEO_PARTITION_KEY = "Meteorological_Prevision_Data"
 
+RECONSTRUCTED_TABLE = "conso_historiques_reconstructed"
+RECONSTRUCTED_PARTITION_KEY = CONSO_PARTITION_KEY
+
+# Maps --building CLI argument to (value_column, quality_column) in the
+# reconstructed table. Keep in sync with cassandra/schema.cql.
+BUILDING_TO_RECONSTRUCTED_COLUMNS = {
+    "Ptot_HA":        ("Ptot_HA",        "quality_ha"),
+    "Ptot_HEI_13RT":  ("Ptot_HEI_13RT",  "quality_hei_13rt"),
+    "Ptot_HEI_5RNS":  ("Ptot_HEI_5RNS",  "quality_hei_5rns"),
+    "Ptot_RIZOMM":    ("Ptot_RIZOMM",    "quality_rizomm"),
+    "Ptot_Campus":    ("Ptot_Campus",    "quality_campus"),
+}
+
 OUTPUT_DIR = os.environ.get(
     "IMPUTER_OUTPUT_DIR",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "output"),

@@ -11,6 +11,9 @@ from config import (
     CONSO_PARTITION_KEY,
     METEO_TABLE,
     METEO_PARTITION_KEY,
+    RECONSTRUCTED_TABLE,
+    RECONSTRUCTED_PARTITION_KEY,
+    BUILDING_TO_RECONSTRUCTED_COLUMNS,
 )
 
 
@@ -86,5 +89,36 @@ def load_weather_data_cassandra():
             f"({df['Date'].min()} -> {df['Date'].max()})"
         )
         return df
+    finally:
+        cluster.shutdown()
+
+
+def write_reconstructed_window(building, timestamps, values, quality):
+    """Upsert one building's reconstructed 7-day window (1008 rows) into
+    conso_historiques_reconstructed. Only the building's value and quality
+    columns are named, so sibling buildings' columns on the same row are
+    left untouched."""
+    if building not in BUILDING_TO_RECONSTRUCTED_COLUMNS:
+        raise ValueError(f"unknown building {building!r}")
+    value_col, quality_col = BUILDING_TO_RECONSTRUCTED_COLUMNS[building]
+
+    session, cluster = _get_session()
+    try:
+        cql = (
+            f'INSERT INTO {RECONSTRUCTED_TABLE} '
+            f'(name, "Date", "{value_col}", {quality_col}) '
+            f'VALUES (?, ?, ?, ?)'
+        )
+        prepared = session.prepare(cql)
+        partition = RECONSTRUCTED_PARTITION_KEY
+        for ts, v, q in zip(timestamps, values, quality):
+            session.execute(
+                prepared,
+                (partition, ts.to_pydatetime(), float(v), int(q)),
+            )
+        print(
+            f"[Cassandra] Wrote {len(values)} rows to {RECONSTRUCTED_TABLE} "
+            f"for {building}"
+        )
     finally:
         cluster.shutdown()

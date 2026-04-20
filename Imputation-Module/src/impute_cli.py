@@ -506,6 +506,18 @@ def main():
     else:
         print(f"[OK] Imputed {n_gaps} gap point(s) -> {args.output}")
 
+    if args.source == "cassandra":
+        try:
+            from cassandra_client import write_reconstructed_window
+            write_reconstructed_window(
+                building_column,
+                df["timestamp"],
+                imputed.to_numpy(),
+                quality.to_numpy().astype(int),
+            )
+        except Exception as exc:
+            fail(f"could not write reconstruction to Cassandra: {exc}")
+
     if args.test_report:
         write_test_report(
             args.test_report,
