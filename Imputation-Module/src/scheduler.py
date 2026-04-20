@@ -75,11 +75,16 @@ def _tomorrow_iso() -> str:
     return (datetime.now(tz) + timedelta(days=1)).date().isoformat()
 
 
-def run_daily_imputation(with_plots: bool = False) -> list:
+def run_daily_imputation(
+    with_plots: bool = False,
+    overlay_prior_week: bool = False,
+    overlay_actual: bool = False,
+) -> list:
     target_date = _tomorrow_iso()
     log.info(
-        "=== Daily imputation run for target_date=%s (with_plots=%s) ===",
-        target_date, with_plots,
+        "=== Daily imputation run for target_date=%s "
+        "(with_plots=%s overlay_prior_week=%s overlay_actual=%s) ===",
+        target_date, with_plots, overlay_prior_week, overlay_actual,
     )
 
     _wipe_previous_outputs()
@@ -100,6 +105,10 @@ def run_daily_imputation(with_plots: bool = False) -> list:
                 IO_DIR, f"reconstructed_{building}_{target_date}.png"
             )
             cmd.extend(["--plot", plot_path])
+        if overlay_prior_week:
+            cmd.append("--overlay-prior-week")
+        if overlay_actual:
+            cmd.append("--overlay-actual")
         log.info("Running: %s", " ".join(cmd))
         try:
             result = subprocess.run(
@@ -151,18 +160,39 @@ def _parse_args() -> argparse.Namespace:
             "so the nightly cron run stays CSV-only."
         ),
     )
+    parser.add_argument(
+        "--overlay-prior-week", action="store_true",
+        help=(
+            "Overlay the 7 days preceding the reconstructed window on the "
+            "plot (shifted +7 days) as a 'copy last week' baseline. "
+            "Only meaningful with --with-plots."
+        ),
+    )
+    parser.add_argument(
+        "--overlay-actual", action="store_true",
+        help=(
+            "Overlay the pre-imputation measured values on the plot. "
+            "Only meaningful with --with-plots."
+        ),
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
 
+    run_kwargs = dict(
+        with_plots=args.with_plots,
+        overlay_prior_week=args.overlay_prior_week,
+        overlay_actual=args.overlay_actual,
+    )
+
     if args.run_now:
         log.info(
-            "Mode=run-now with_plots=%s Buildings=%s",
-            args.with_plots, config.BUILDINGS,
+            "Mode=run-now %s Buildings=%s",
+            run_kwargs, config.BUILDINGS,
         )
-        failures = run_daily_imputation(with_plots=args.with_plots)
+        failures = run_daily_imputation(**run_kwargs)
         sys.exit(1 if failures else 0)
 
     scheduler = BlockingScheduler(timezone=config.TIMEZONE)
@@ -170,7 +200,7 @@ def main() -> None:
         hour=SCHEDULE_HOUR, minute=SCHEDULE_MINUTE, timezone=config.TIMEZONE,
     )
     scheduler.add_job(
-        functools.partial(run_daily_imputation, with_plots=args.with_plots),
+        functools.partial(run_daily_imputation, **run_kwargs),
         trigger=trigger,
         id="daily_imputation",
         name="Daily imputation for all buildings",
@@ -178,8 +208,8 @@ def main() -> None:
         coalesce=True,
     )
     log.info(
-        "Mode=daemon with_plots=%s Cron=%02d:%02d %s Buildings=%s Next run=%s",
-        args.with_plots,
+        "Mode=daemon %s Cron=%02d:%02d %s Buildings=%s Next run=%s",
+        run_kwargs,
         SCHEDULE_HOUR, SCHEDULE_MINUTE, config.TIMEZONE,
         config.BUILDINGS,
         trigger.get_next_fire_time(None, datetime.now(pytz.timezone(config.TIMEZONE))),
