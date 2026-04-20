@@ -1630,27 +1630,37 @@ class ExtendedDeploymentAlgorithm:
         baseline so the template's local shape cannot produce a visible
         discontinuity a few steps in from the boundary.
 
-        Residuals are computed as the median of (y - tpl) over a ~1h window
-        on each side of the gap, NOT as a single-point difference. The
-        single-point form `dL = y(gap_start-1) - tpl(gap_start-1)` conflated
-        two things:
-          (a) the true observation-vs-template residual we want to propagate;
-          (b) the *step* in the per-(day, hour) template between the last
-              pre-gap step and the first in-gap step (e.g., Fri-23h vs
-              Sat-00h in a per-day-of-week template).
-        Effect (b) would leak into dL and produce a visible dip a few hours
-        into the gap once the exponential boundary blend fades. Averaging
-        over ~6 samples on a single side of the boundary stays inside one
-        (day, hour) regime and also damps single-point observation noise.
+        Boundary residuals dL and dR are picked as the SMALLER-MAGNITUDE of
+        two candidates:
+          (a) OUTSIDE-windowed: median of (y - tpl) over ~1h of observed
+              samples just outside the gap. Captures persistent residuals
+              near the boundary, but because tpl is per-(dow, hour) it
+              also picks up any template step across the gap boundary
+              (e.g. Fri-23h -> Sat-00h) as if it were a real residual.
+          (b) INSIDE-referenced: the boundary observation minus the median
+              of the first / last few in-gap template values. Uses the
+              same template we will actually be filling with as reference,
+              so any cross-boundary template step cancels out.
+        A genuine observation residual shows up with similar magnitude in
+        both candidates, so picking the smaller preserves it. A template
+        step only inflates (a); taking the smaller therefore strips it
+        out and avoids the visible "dip" several hours into the gap that
+        the original single-point `dL = y(gs-1) - tpl(gs-1)` produced.
 
-        Step 1: add a linear blend of the two residuals to shift the template
-                level so it lands on y_L at gap_start-1 and y_R at gap_end.
+        The residual shifts themselves are faded into the gap with an
+        EXPONENTIAL weight on the same time constant `tau` as the
+        boundary blend below, so they only influence points within
+        ~2*tau of their own edge; the middle of a long gap falls back
+        to the pure template.
+
+        Step 1: add an exponentially-decaying residual shift to the template,
+                so the fill lands on y_L-residual level near the left edge,
+                on y_R-residual level near the right edge, and on the pure
+                template deep inside the gap.
         Step 2: if both endpoints are observed, blend the anchored template
-                with a pure linear y_L -> y_R interpolation. The blend weight
-                is boundary-heavy (exponential with length `tau`) so the
-                first/last ~tau steps are dominated by the linear baseline
-                (no template shape leaking through), and the interior is
-                dominated by the anchored template (daily shape preserved).
+                with a linear y_L -> y_R interpolation, with the same
+                exponential weight, so the first/last ~tau steps are
+                dominated by the observed boundary values.
 
         `tpl_fn(idx) -> float` returns the template value at row `idx`. If
         None, falls back to the weekly-template lookup used by
@@ -1674,7 +1684,14 @@ class ExtendedDeploymentAlgorithm:
         # (day_of_week, hour) regime, large enough to damp per-point noise.
         ANCHOR_WINDOW = 6
 
-        def _windowed_residual(lo: int, hi: int) -> float:
+        def _windowed_outside(lo: int, hi: int) -> float:
+            """Median of (y - tpl(k)) over a window of observed samples
+            OUTSIDE the gap. tpl is evaluated at the SAME index as each y,
+            so this is a pure observation-vs-its-own-template residual.
+            Unfortunately it also absorbs any per-(dow, hour) template step
+            across the gap boundary (e.g. Fri-23h template sits above
+            Sat-00h template when past Fridays ran elevated late-evening
+            activity), treating that step as if it were a real residual."""
             lo = max(0, min(len(df), lo))
             hi = max(0, min(len(df), hi))
             if hi <= lo:
@@ -1690,17 +1707,48 @@ class ExtendedDeploymentAlgorithm:
                 residuals.append(y_k - t_k)
             return float(np.median(residuals)) if residuals else np.nan
 
+        def _inside_ref(y_boundary: float, inside_slice) -> float:
+            """Boundary observation minus the median of in-gap template
+            values. Uses the template we will actually be filling with as
+            reference, so any cross-boundary template step cancels out -
+            it can only reflect a genuine observed-vs-template offset."""
+            if not np.isfinite(y_boundary):
+                return np.nan
+            vals = np.asarray(inside_slice, dtype=float)
+            vals = vals[np.isfinite(vals)]
+            if vals.size == 0:
+                return np.nan
+            return float(y_boundary - np.median(vals))
+
+        def _smaller_magnitude(a: float, b: float) -> float:
+            """Pick whichever residual candidate has smaller |magnitude|.
+            A genuine observation residual shows up similarly in both the
+            outside and inside estimates; a per-(dow, hour) template step
+            only inflates the outside one. Taking the smaller therefore
+            strips the template-step component while preserving real
+            residuals."""
+            if not np.isfinite(a) and not np.isfinite(b):
+                return np.nan
+            if not np.isfinite(a):
+                return b
+            if not np.isfinite(b):
+                return a
+            return a if abs(a) < abs(b) else b
+
         y_L = df.loc[gap_start - 1, site] if gap_start > 0        else np.nan
         y_R = df.loc[gap_end,        site] if gap_end   < len(df) else np.nan
 
-        # Windowed residuals (robust). Each window is entirely on one side
-        # of the gap boundary, so it cannot pick up the template step
-        # across the boundary.
-        dL = _windowed_residual(gap_start - ANCHOR_WINDOW, gap_start)
-        dR = _windowed_residual(gap_end, gap_end + ANCHOR_WINDOW)
+        W_inside = min(ANCHOR_WINDOW, n)
+        dL_outside = _windowed_outside(gap_start - ANCHOR_WINDOW, gap_start)
+        dR_outside = _windowed_outside(gap_end, gap_end + ANCHOR_WINDOW)
+        dL_inside  = _inside_ref(y_L, filled_vals[:W_inside])
+        dR_inside  = _inside_ref(y_R, filled_vals[-W_inside:])
 
-        # Single-point fallback (preserves v1 behaviour) when the window has
-        # no usable data - e.g. the gap is flanked by other gaps.
+        dL = _smaller_magnitude(dL_outside, dL_inside)
+        dR = _smaller_magnitude(dR_outside, dR_inside)
+
+        # Single-point fallback (preserves v1 behaviour) when the candidates
+        # above failed - e.g. the gap is flanked by other gaps.
         if not np.isfinite(dL) and gap_start > 0:
             t_L = tpl(gap_start - 1)
             if np.isfinite(y_L) and np.isfinite(t_L):
@@ -1718,15 +1766,28 @@ class ExtendedDeploymentAlgorithm:
             dR = dL
 
         alpha = (np.arange(n) + 1) / (n + 1)
-        anchored = filled_vals + (1 - alpha) * dL + alpha * dR
+
+        # Exponential (not linear) fade of the boundary residuals.
+        # The previous form `(1 - alpha) * dL + alpha * dR` only decays
+        # linearly across the gap, so a residual observed at the left
+        # boundary still contributes at ~83% strength 4h into a 24h gap.
+        # That turned a legitimate day-level Friday residual into a
+        # multi-hour dip on Saturday. dL/dR really only carry reliable
+        # information about the few steps adjacent to the boundary they
+        # came from, so their influence should decay on the same time
+        # constant `tau` as the boundary blend below; the middle of a
+        # long gap is then driven by the pure template.
+        tau = max(6.0, min(36.0, n / 12.0))
+        i_arr = np.arange(n, dtype=float)
+        wL = np.exp(-i_arr / tau)
+        wR = np.exp(-(n - 1 - i_arr) / tau)
+        anchored = filled_vals + wL * dL + wR * dR
 
         if np.isfinite(y_L) and np.isfinite(y_R):
             baseline = y_L + alpha * (y_R - y_L)
-            # ~1h (6 samples) minimum; scales up for very long gaps but capped
-            # so the interior still shows template shape on multi-hour gaps.
-            tau = max(6.0, min(36.0, n / 12.0))
-            i = np.arange(n, dtype=float)
-            w = np.maximum(np.exp(-i / tau), np.exp(-(n - 1 - i) / tau))
+            # Boundary blend: close to y_L / y_R within ~tau steps of each
+            # edge, pure anchored template deep inside the gap.
+            w = np.maximum(wL, wR)
             return w * baseline + (1 - w) * anchored
 
         return anchored
