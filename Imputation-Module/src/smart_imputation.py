@@ -1,13 +1,14 @@
-"""
-Extended Deployment Gap Recovery Algorithm — v2
-Adds to the fixed v1:
-  ✓ Full audit log (instance + auto-saved JSON per run)
-  ✓ Per-gap record: missing timestamps, day, occupancy, method, confidence,
-    inputs used (template values / peer ratios / bounds), routing trace
-  ✓ Run-level summary: gaps found, sites affected, methods used, mean confidence
-  ✓ Detection log: how each gap was found
-  ✓ Zero-fill detection via IsolationForest → re-impute flagged regions
-  ✓ Timezone awareness: Europe/Paris (CET/CEST), DST spring-forward + fall-back
+"""Extended deployment gap-recovery algorithm.
+
+The entry point is ExtendedDeploymentAlgorithm.impute(). It keeps a per-run
+audit log (also auto-saved as JSON), flags suspect zero-fills via
+IsolationForest before routing, and handles DST transitions in Europe/Paris
+(spring-forward and fall-back).
+
+The audit log records, per gap: missing timestamps, day, occupancy, method,
+confidence, the inputs used (template values, peer ratios, bounds) and the
+routing trace; per run it summarises gaps found, sites affected, methods used,
+and mean confidence.
 """
 
 import json
@@ -43,7 +44,7 @@ except ImportError:
 log = logging.getLogger(__name__)
 
 SITE_COLS = ['Ptot_HA', 'Ptot_HEI', 'Ptot_HEI_13RT', 'Ptot_HEI_5RNS', 'Ptot_RIZOMM', 'Ptot_Ilot']
-STEPS_PER_DAY = 144  # 10-min intervals × 6/hr × 24 hr
+STEPS_PER_DAY = 144  # 10-min intervals: 6/hr * 24 hr
 SITE_TZ = 'Europe/Paris'
 
 METER_HIERARCHY = {
@@ -55,9 +56,9 @@ METER_HIERARCHY = {
 }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Holiday loading
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _load_all_holidays():
     holidays: set = set()
@@ -80,9 +81,9 @@ def _load_all_holidays():
 FRANCE_HOLIDAYS_2026, FRANCE_CLOSE_DAYS_2026, FRANCE_SPECIAL_DAYS_2026 = _load_all_holidays()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Audit helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _ts(dt) -> str:
     """Convert a pandas Timestamp or datetime to an ISO string for JSON serialisation."""
@@ -114,9 +115,9 @@ def _json_safe(obj):
     return obj
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Main class
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 class ExtendedDeploymentAlgorithm:
     """
@@ -139,7 +140,7 @@ class ExtendedDeploymentAlgorithm:
         template_lookback_days: int = 28,
         use_smart_chunking: bool = True,
         adaptive_template_bias: float = 0.7,
-        # ── NEW v2 params ──────────────────────────────────────────────────
+        # params
         audit_log_dir: str = 'audit_logs',
         timezone: str = SITE_TZ,
         zero_fill_contamination: float = 0.05,
@@ -183,13 +184,13 @@ class ExtendedDeploymentAlgorithm:
         self._external_event_flags: Dict = {}
         self._weather_variance: Dict = {}
 
-        # ── v2: audit state ───────────────────────────────────────────────
+        # audit state
         # Cleared at the start of each impute() call.
         self._audit_log: Dict[str, Any] = {}
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     # Persistence
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
 
     def save_templates(self, filepath: str):
         """Save templates and statistics to a pickle file for later reuse."""
@@ -217,19 +218,19 @@ class ExtendedDeploymentAlgorithm:
         self._uncertainty_bounds = data.get('uncertainty_bounds', {})
         log.info(f"[PERSIST] Loaded templates from {filepath}")
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # NEW v2: Timezone handling
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
+    # Timezone handling
+    # -------------------------------------------------------------------------
 
     def _localise_timestamps(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Ensure all Timestamps are timezone-aware in self.timezone (Europe/Paris).
 
         Handles three input cases:
-          1. Naive timestamps (no tz info)  → localise directly, ambiguous=False (keep first),
+          1. Naive timestamps (no tz info)  -> localise directly, ambiguous=False (keep first),
              nonexistent='shift_forward' (spring-forward gap filled).
-          2. UTC-aware timestamps           → convert to local tz.
-          3. Already localised              → convert to self.timezone if different.
+          2. UTC-aware timestamps           -> convert to local tz.
+          3. Already localised              -> convert to self.timezone if different.
 
         Returns df with tz-aware Timestamps.  DST events are recorded in the
         audit log under 'detection_summary.dst_events'.
@@ -245,7 +246,7 @@ class ExtendedDeploymentAlgorithm:
             dst_events = []
 
             if ts.dt.tz is None:
-                # Naive → localise.  'ambiguous=False' keeps the first (pre-fallback) reading
+                # Naive -> localise.  'ambiguous=False' keeps the first (pre-fallback) reading
                 # for the duplicated fall-back hour. 'nonexistent=shift_forward' maps the
                 # missing spring-forward hour to the post-transition time.
                 df['Timestamp'] = pd.to_datetime(ts).dt.tz_localize(
@@ -273,7 +274,7 @@ class ExtendedDeploymentAlgorithm:
         Scan for DST transition artefacts in the (now tz-aware) timestamp series.
 
         Spring-forward: a 10-min step that is actually 70 min (one slot vanishes).
-        Fall-back:      a 10-min step that is actually −50 min (duplicate hour).
+        Fall-back:      a 10-min step that is actually -50 min (duplicate hour).
 
         Returns a list of event dicts for the audit log.
         """
@@ -313,9 +314,9 @@ class ExtendedDeploymentAlgorithm:
 
         return events
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # NEW v2: Audit log initialisation and saving
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
+    # Audit log initialisation and saving
+    # -------------------------------------------------------------------------
 
     def _init_audit_log(self, df: pd.DataFrame):
         """
@@ -363,8 +364,8 @@ class ExtendedDeploymentAlgorithm:
                 'dst_events': [],
             },
             'gaps': [],                    # one entry per (site, gap_start, gap_end)
-            'raw_anomaly_corrections': [], # implausible raw values → NaN before filling
-            'zero_fill_corrections': [],   # near-zero imputed values → re-imputed
+            'raw_anomaly_corrections': [], # implausible raw values -> NaN before filling
+            'zero_fill_corrections': [],   # near-zero imputed values -> re-imputed
             'run_summary': {},             # filled at end of impute()
         }
         log.info(f"[AUDIT] Run {run_id} started. Sites with gaps: {sites_with_gaps}")
@@ -531,45 +532,33 @@ class ExtendedDeploymentAlgorithm:
         except Exception as e:
             log.error(f"[AUDIT] Failed to finalise audit log: {e}")
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # NEW v2: Zero-fill detection
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
+    # Zero-fill detection
+    # -------------------------------------------------------------------------
 
     def _detect_raw_anomalies(self, df: pd.DataFrame) -> Dict[str, List[Dict]]:
-        """
-        PRE-FILL anomaly detection: scan raw input values (before any gap-filling)
-        for implausible readings that are NOT explicit NaN — stuck sensors, flat
-        lines, near-zero readings on active meters, and statistical outliers.
+        """Flag implausible non-NaN readings in the raw input before gap-filling.
 
-        Detected rows are converted to NaN in-place so the normal routing pipeline
-        treats them as gaps and fills them with the appropriate method.
+        Targets stuck sensors, flat lines, near-zeros on active meters, and
+        single-point statistical outliers. Flagged rows are set to NaN in-place
+        so the normal gap-filling pipeline reconstructs them.
 
-        Three complementary detectors run in sequence per site:
+        Three detectors run per site:
 
-        1. STUCK-SENSOR  — a run of ≥ stuck_run_min consecutive identical (or
-           near-identical) non-zero values.  E.g. a meter frozen at 42.0 kW for
-           3+ hours signals a communication fault, not real consumption.
-           Threshold: consecutive readings with |val - val[i-1]| < 0.01% of the
-           site median for ≥ stuck_run_min steps.
+        - Stuck sensor: a run of at least ``stuck_run_min`` consecutive readings
+          within 0.01% of the site median, on non-zero values. A meter frozen at
+          42.0 kW for 3+ hours is a comms fault, not real consumption.
+        - Near-zero: a non-NaN value below 1% of the site median during
+          historically active hours (``work_hours``, ``evening``). Skipped on
+          weekends and holidays, where low consumption is legitimate.
+        - Isolation forest: global outlier detection fitted on the valid
+          (non-stuck, non-zero) portion of each column. Uses ``[value,
+          hour_of_day]`` so 14:00 and 03:00 are evaluated separately. Falls back
+          to a 3-sigma z-score if ``IsolationForest`` is unavailable.
 
-        2. NEAR-ZERO     — a non-NaN value below 1% of the site median during
-           hours that are historically active (work_hours / evening).  A meter
-           reading 0 during a busy Tuesday afternoon is implausible.
-           Not applied to weekend or holiday rows (legitimate low-consumption).
-
-        3. ISOLATION FOREST — global statistical outlier detection fitted on the
-           valid (non-stuck, non-zero) portion of each site column.  Flags the
-           contamination% most anomalous single-point spikes or dips.  Uses a
-           2-feature vector: [value, hour_of_day] so the model understands that
-           a high reading at 14:00 is normal but the same value at 03:00 is not.
-           Falls back to a 3-σ z-score check if IsolationForest is unavailable.
-
-        All three detectors contribute to a unified anomaly_mask per site.
-        Overlapping detections are merged before NaN-conversion so each
-        contiguous bad run is logged as a single audit entry.
-
-        Returns a dict  { site: [ {anomaly_record}, … ] }  which is merged into
-        self._audit_log['raw_anomaly_corrections'].
+        The three masks are combined per site, contiguous runs are merged, and
+        one audit entry is emitted per bad run. The returned dict gets merged
+        into ``self._audit_log['raw_anomaly_corrections']``.
         """
         MIN_VALID_ROWS = 30          # need enough data to fit the model
         STUCK_RUN_MIN = 18           # 3 hours of identical readings = stuck
@@ -600,7 +589,7 @@ class ExtendedDeploymentAlgorithm:
             anomaly_mask = np.zeros(n, dtype=bool)
             detection_reasons = [''] * n   # track which detector flagged each row
 
-            # ── 1. STUCK-SENSOR DETECTION ────────────────────────────────────
+            # 1. STUCK-SENSOR DETECTION
             stuck_threshold = site_median * 0.0001  # 0.01% tolerance
             idx_valid = np.where(valid_mask.values)[0]
             vals_valid = col.values[idx_valid]
@@ -625,12 +614,12 @@ class ExtendedDeploymentAlgorithm:
                     anomaly_mask[row_idx] = True
                     detection_reasons[row_idx] = 'stuck_sensor'
 
-            # ── 2. NEAR-ZERO DETECTION ───────────────────────────────────────
+            # 2. NEAR-ZERO DETECTION
             zero_threshold = site_median * NEAR_ZERO_PCT
             if 'OccupancyType' in df.columns:
                 active_rows = df['OccupancyType'].isin(ACTIVE_OCCUPANCY)
             else:
-                # No occupancy column yet — flag all non-NaN near-zeros
+                # No occupancy column yet, flag all non-NaN near-zeros
                 active_rows = pd.Series(True, index=df.index)
 
             near_zero_mask = (
@@ -644,7 +633,7 @@ class ExtendedDeploymentAlgorithm:
                 if not detection_reasons[row_idx]:
                     detection_reasons[row_idx] = 'near_zero'
 
-            # ── 3. ISOLATION FOREST (or z-score fallback) ────────────────────
+            # 3. ISOLATION FOREST (or z-score fallback)
             # Fit only on rows that passed the first two detectors and are valid.
             clean_mask = valid_mask.values & ~anomaly_mask
             clean_indices = np.where(clean_mask)[0]
@@ -652,7 +641,7 @@ class ExtendedDeploymentAlgorithm:
             if len(clean_indices) >= MIN_VALID_ROWS:
                 clean_vals = col.values[clean_indices]
                 clean_hours = df['Hour'].values[clean_indices] if 'Hour' in df.columns else np.zeros(len(clean_indices))
-                # 2-feature: [value, hour] — lets the model learn that high values
+                # 2-feature: [value, hour], lets the model learn that high values
                 # at night are anomalous even if the value itself is plausible by day
                 X_clean = np.column_stack([clean_vals, clean_hours])
 
@@ -683,7 +672,7 @@ class ExtendedDeploymentAlgorithm:
                         anomaly_mask[row_idx] = True
                         detection_reasons[row_idx] = 'isolation_forest_outlier'
 
-            # ── Apply: convert flagged rows to NaN ───────────────────────────
+            # Apply: convert flagged rows to NaN
             flagged_row_indices = np.where(anomaly_mask)[0]
             if len(flagged_row_indices) == 0:
                 continue
@@ -722,7 +711,7 @@ class ExtendedDeploymentAlgorithm:
                     'site_median_at_detection': round(site_median, 4),
                     'zero_threshold_used': round(zero_threshold, 4),
                 }
-                # Overwrite with NaN — the router will fill them in the gap loop
+                # Overwrite with NaN, the router will fill them in the gap loop
                 df.loc[run_start:run_end - 1, site] = np.nan
                 site_corrections.append(correction_record)
 
@@ -837,7 +826,7 @@ class ExtendedDeploymentAlgorithm:
                 prev = idx
             flagged_gaps.append((run_start, prev + 1))
 
-            log.info(f"[ZERO-FILL] {site}: {len(flagged_gaps)} suspect zero-fill region(s) → re-imputing")
+            log.info(f"[ZERO-FILL] {site}: {len(flagged_gaps)} suspect zero-fill region(s) -> re-imputing")
 
             for zf_start, zf_end in flagged_gaps:
                 original_vals = df.loc[zf_start:zf_end - 1, site].tolist()
@@ -864,25 +853,26 @@ class ExtendedDeploymentAlgorithm:
                 ]
                 self._audit_log['zero_fill_corrections'].append(correction_record)
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     # Main entry point
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
 
     def impute(self, df: pd.DataFrame, weather_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
-        """
-        Main entry point.  Returns a fully-imputed dataframe with tz-aware
-        timestamps.  Saves a JSON audit log to self.audit_log_dir after each run.
+        """Fill all NaN values in df and return the completed frame.
+
+        Timestamps come back tz-aware, and a JSON audit log is written to
+        ``self.audit_log_dir`` after every run.
         """
         df = df.copy().sort_values('Timestamp').reset_index(drop=True)
 
-        # ── NEW v2: localise timestamps first ────────────────────────────────
+        # localise timestamps first
         df = self._localise_timestamps(df)
 
         if weather_df is not None:
             self.weather_df = weather_df
             df = self._merge_weather(df)
 
-        # ── NEW v2: initialise audit log (after tz conversion) ───────────────
+        # initialise audit log (after tz conversion)
         self._init_audit_log(df)
 
         # Reindex to complete 10-min grid (tz-aware)
@@ -911,7 +901,7 @@ class ExtendedDeploymentAlgorithm:
         self._add_occupancy_features(df)
         self._add_external_features(df)
 
-        # ── NEW v2: pre-fill anomaly detection (stuck sensors, near-zeros, IF outliers)
+        # pre-fill anomaly detection (stuck sensors, near-zeros, IF outliers)
         # Must run AFTER feature engineering so occupancy columns are available,
         # and BEFORE template building so templates are not contaminated by bad values.
         self._detect_raw_anomalies(df)
@@ -946,7 +936,7 @@ class ExtendedDeploymentAlgorithm:
         # NaN guard
         self._nan_guard_final_pass(df)
 
-        # ── NEW v2: zero-fill detection and correction ───────────────────────
+        # zero-fill detection and correction
         self._detect_zero_fills(df, imputed_gaps)
 
         # Smoothing
@@ -954,15 +944,15 @@ class ExtendedDeploymentAlgorithm:
             if site in df.columns:
                 self._smooth_junctions(df, site)
 
-        # ── NEW v2: finalise and save audit log ──────────────────────────────
+        # finalise and save audit log
         self._finalise_audit_log(df)
 
         out_cols = ['Timestamp'] + self.site_cols + (['AirTemp'] if 'AirTemp' in df.columns else [])
         return df[[c for c in out_cols if c in df.columns]]
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     # Public accessors for audit data
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
 
     def get_audit_log(self) -> Dict:
         """Return the full audit log dict from the most recent impute() run."""
@@ -991,7 +981,7 @@ class ExtendedDeploymentAlgorithm:
                 'method':              g['method'],
                 'confidence':          g['confidence'],
                 'zero_fill_corrected': g['zero_fill_corrected'],
-                'routing_trace':       ' → '.join(g['routing_trace']),
+                'routing_trace':       ' -> '.join(g['routing_trace']),
             })
         return pd.DataFrame(rows)
 
@@ -1025,15 +1015,15 @@ class ExtendedDeploymentAlgorithm:
             })
         return pd.DataFrame(rows)
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     # Chunked gap recovery
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
 
     def _fill_chunked_gap(self, df: pd.DataFrame, site: str, gap_start: int, gap_end: int):
         gap_size = gap_end - gap_start
         if self.use_smart_chunking:
             chunks = self._get_smart_chunks(df, gap_start, gap_end)
-            log.info(f"[CHUNKED-SMART] {site}: {gap_size} steps → {len(chunks)} chunks")
+            log.info(f"[CHUNKED-SMART] {site}: {gap_size} steps -> {len(chunks)} chunks")
         else:
             n = int(np.ceil(gap_size / self.gap_chunk_size))
             chunks = [
@@ -1041,7 +1031,7 @@ class ExtendedDeploymentAlgorithm:
                  min(gap_start + (i + 1) * self.gap_chunk_size, gap_end))
                 for i in range(n)
             ]
-            log.info(f"[CHUNKED] {site}: {gap_size} steps → {n} chunks")
+            log.info(f"[CHUNKED] {site}: {gap_size} steps -> {n} chunks")
 
         used_multi_week = False
         for chunk_idx, (cs, ce) in enumerate(chunks):
@@ -1062,9 +1052,9 @@ class ExtendedDeploymentAlgorithm:
             filled = self._validate_and_clip(filled, site, df)
             df.loc[gap_start:gap_end - 1, site] = filled
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     # Smart chunking
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
 
     def _get_smart_chunks(self, df: pd.DataFrame, gap_start: int, gap_end: int) -> List[Tuple[int, int]]:
         chunks = []
@@ -1113,9 +1103,9 @@ class ExtendedDeploymentAlgorithm:
         log.debug(f"[SMART-CHUNK] {len(chunks)} chunks, high-var threshold: {v_threshold:.1f}")
         return chunks
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     # Multi-week template building
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
 
     def _build_weekly_templates(self, df: pd.DataFrame):
         try:
@@ -1185,9 +1175,9 @@ class ExtendedDeploymentAlgorithm:
         except Exception as e:
             log.error(f"[ERROR] _build_weekly_templates: {e}")
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     # Multi-week template fill
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
 
     def _fill_with_multi_week_template(
         self, df: pd.DataFrame, site: str, gap_start: int, gap_end: int,
@@ -1246,9 +1236,9 @@ class ExtendedDeploymentAlgorithm:
             log.error(f"[ERROR] _fill_with_multi_week_template ({site}): {e}")
             self._fill_safe_median_template(df, site, gap_start, gap_end)
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     # Occupancy features
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
 
     def _add_occupancy_features(self, df: pd.DataFrame):
         try:
@@ -1279,9 +1269,9 @@ class ExtendedDeploymentAlgorithm:
             df['IsOccupied'] = True
             df['OccupancyType'] = 'unknown'
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     # External features
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
 
     def _add_external_features(self, df: pd.DataFrame):
         try:
@@ -1325,9 +1315,9 @@ class ExtendedDeploymentAlgorithm:
         except Exception as e:
             log.error(f"[ERROR] _add_external_features: {e}")
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     # Uncertainty bounds
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
 
     def _build_uncertainty_bounds(self, df: pd.DataFrame):
         try:
@@ -1344,9 +1334,9 @@ class ExtendedDeploymentAlgorithm:
         except Exception as e:
             log.error(f"[ERROR] _build_uncertainty_bounds: {e}")
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     # Confidence scoring
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
 
     def _calculate_confidence_with_uncertainty(
         self, site: str, gap_size: int, day_type: str, strategy: str,
@@ -1382,9 +1372,9 @@ class ExtendedDeploymentAlgorithm:
                 'reason': 'low_confidence_score',
             })
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     # Intelligent router (updated to write audit records + routing trace)
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
 
     def _intelligent_router(
         self, df: pd.DataFrame, site: str, gap_start: int, gap_end: int,
@@ -1477,9 +1467,9 @@ class ExtendedDeploymentAlgorithm:
             self._fill_safe_linear_median(df, site, gap_start, gap_end)
             _log_and_record('SAFE_LINEAR_MEDIAN')
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     # Fill primitives (unchanged from v1)
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
 
     def _fill_linear(self, df, site, gap_start, gap_end):
         try:
@@ -1619,9 +1609,9 @@ class ExtendedDeploymentAlgorithm:
             log.error(f"[ERROR] _fill_with_knn_context ({site}): {e}")
             return False
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     # Validation, cleanup, smoothing
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
 
     def _anchor_to_boundaries(self, df, site, gap_start, gap_end, filled_vals, tpl_fn=None):
         """
@@ -1835,9 +1825,9 @@ class ExtendedDeploymentAlgorithm:
         except Exception as e:
             log.debug(f"[DEBUG] _smooth_junctions ({site}): {e}")
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     # Helper methods
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
 
     def _add_datetime_features(self, df: pd.DataFrame):
         """
@@ -1964,9 +1954,9 @@ class ExtendedDeploymentAlgorithm:
         gaps.append((start, indices[-1] + 1))
         return gaps
 
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     # Legacy accessors
-    # ─────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
 
     def get_low_confidence_report(self) -> pd.DataFrame:
         return pd.DataFrame(self._low_confidence_flags) if self._low_confidence_flags else pd.DataFrame()

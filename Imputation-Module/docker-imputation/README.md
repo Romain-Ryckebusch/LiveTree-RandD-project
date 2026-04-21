@@ -11,92 +11,86 @@ cd "Imputation-Module/docker-imputation"
 docker compose build
 ```
 
-The compose file's build context is the project root, so the Dockerfile can
-`COPY` from `Imputation-Module/src/`. First build is 3-5 minutes; subsequent
-builds reuse the pip layer.
+The build context is the project root, so the Dockerfile can `COPY` from
+`Imputation-Module/src/`. First build takes 3-5 minutes; later builds reuse
+the pip layer.
 
 ## Daemon mode (default)
 
-`docker compose up -d` launches a long-running scheduler. Every day at **23:50
-Europe/Paris** it imputes all five buildings for the next day's prediction:
+`docker compose up -d` starts a long-running scheduler. At 23:50 Europe/Paris
+every day, the scheduler pulls the 7-day window ending at the current timestamp
+and runs the imputer once for each entry in `config.BUILDINGS`. The
+reconstructed series feeds the next day's forecast (a run on the evening of
+2026-04-22 produces the input for the 2026-04-23 prediction).
 
-- `TARGET_DATE` is computed as tomorrow in Europe/Paris (so a run at 23:50 on
-  2026-04-22 feeds the 2026-04-23 forecast).
-- The 7-day Cassandra window ending at 23:50 of the current day is pulled and
-  reconstructed once per building in `config.BUILDINGS`.
-- Before each batch, previous `reconstructed_*.csv` files are wiped from
-  `/io/` so only the latest run remains on disk. Audit logs under
-  `/io/audit_logs/` are preserved.
-- Outputs land at `./io/reconstructed_<building>_<target_date>.csv`.
-- A failure on one building is logged to stdout and the batch continues with
-  the next. The container keeps running thanks to
-  `restart: unless-stopped`.
+Outputs land at `./io/reconstructed_<building>_<target_date>.csv`. Previous
+`reconstructed_*.csv` files in `/io/` are wiped at the start of each batch so
+only the most recent run remains; audit logs under `/io/audit_logs/` are kept.
 
-Logs stream on `docker compose logs -f imputer`.
+When one building fails the error is logged to stdout and the batch moves on to
+the next. The container itself stays up thanks to `restart: unless-stopped`.
+Follow the logs with `docker compose logs -f imputer`.
 
-The fire time is configurable via env vars (defaults shown):
+The fire time can be changed via environment variables:
 
-- `SCHEDULE_HOUR=23` (0-23)
-- `SCHEDULE_MINUTE=50` (0-59)
+- `SCHEDULE_HOUR` (default `23`, range `0-23`)
+- `SCHEDULE_MINUTE` (default `50`, range `0-59`)
 
-Set them in a `.env` next to `docker-compose.yml`, or override on the command
-line: `SCHEDULE_HOUR=2 SCHEDULE_MINUTE=0 docker compose up -d`.
+Put them in a `.env` next to `docker-compose.yml`, or set them inline:
+`SCHEDULE_HOUR=2 SCHEDULE_MINUTE=0 docker compose up -d`.
 
 ## Manual trigger
 
-To run the same batch on demand (instead of waiting for 23:50) without
-shutting down the daemon, spin up a fresh ephemeral container with
-`--run-now`:
+To run the same batch on demand without restarting the daemon, spin up a
+sibling container with `--run-now`:
 
 ```bash
   docker compose run --rm imputer scheduler.py --run-now --with-plots
 ```
 
-- `--run-now` executes the full per-building batch once and exits. No cron,
-  no daemon loop. Exit code is non-zero if any building failed.
-- `--with-plots` adds a `--plot /io/reconstructed_<building>_<target>.png`
-  to each call so PNG overlays land next to the CSVs. Omit it for CSV-only.
-- `--overlay-prior-week` adds the dashed "copy last week" baseline to each
-  plot (forwarded to `impute_cli.py`). Only meaningful with `--with-plots`.
-- `--overlay-actual` adds the solid pre-imputation measured curve. Only
-  meaningful with `--with-plots`.
-- Target date is still "tomorrow in Europe/Paris" — same semantics as the
-  nightly cron. Use `run-all-buildings.sh` below if you need a custom date
-  or test-gap mode.
-- The daemon container started by `docker compose up -d` is untouched;
-  `docker compose run` creates a sibling container.
+`--run-now` executes the batch once and exits; the exit code is non-zero if at
+least one building failed. The daemon container launched by
+`docker compose up -d` is untouched; `docker compose run` creates a separate
+ephemeral container alongside it. The target date is still "tomorrow in
+Europe/Paris", same as the nightly run.
 
-Example with the last-week baseline on every plot:
+Plot flags (all require `--with-plots`, which adds
+`--plot /io/reconstructed_<building>_<target>.png` to each invocation):
+
+- `--overlay-prior-week`: dashed "copy last week" baseline.
+- `--overlay-actual`: solid pre-imputation measured curve.
+
+Example, with both overlays:
 
 ```bash
   docker compose run --rm imputer scheduler.py \
     --run-now --with-plots --overlay-prior-week --overlay-actual
 ```
 
-For the debug workflow that needs a custom `TARGET_DATE`, `--test-gap`, or
-`--no-clear`, use `./run-all-buildings.sh` instead, which bypasses the
-scheduler and calls `impute_cli.py` per building directly.
+For a custom `TARGET_DATE`, `--test-gap`, or `--no-clear`, bypass the scheduler
+and use `./run-all-buildings.sh` instead (it calls `impute_cli.py` directly).
 
 ## Run
 
-For ad-hoc / test runs, override the default command and name the script
-explicitly (the entrypoint is plain `python`):
+Ad-hoc and test runs override the default command. The container's entrypoint
+is plain `python`, so you name the script explicitly.
 
 ### CSV mode
 
-Put your input at `./io/input.csv`, then:
+With the input at `./io/input.csv`:
 
 ```bash
 docker compose run --rm imputer impute_cli.py --source csv --input /io/input.csv --output /io/output.csv --seed 42
 ```
 
-On success: `[OK] Imputed N gap point(s) -> /io/output.csv` and exit 0.
-On validation or runtime errors: `ERROR: ...` on stderr and exit 1.
+A successful run prints `[OK] Imputed N gap point(s) -> /io/output.csv` and
+exits 0. Validation or runtime errors go to stderr as `ERROR: ...` with
+exit 1.
 
 ### Cassandra mode
 
-Point the container at a reachable cluster and name the target date. The
-7-day window ending the day *before* `--target-date` gets pulled and imputed.
+Point the container at a reachable cluster and supply the target date. The
+7-day window ending the day before `--target-date` is pulled and imputed.
 
 ```bash
 CASSANDRA_HOSTS=10.64.253.10,10.64.253.11,10.64.253.12 \
@@ -106,14 +100,15 @@ CASSANDRA_HOSTS=10.64.253.10,10.64.253.11,10.64.253.12 \
     --output /io/output.csv
 ```
 
-Credentials and keyspace are optional. Can be kept in a `.env` next to
-`docker-compose.yml` (already allowed via `env_file: required: false`).
+Credentials and keyspace are optional, and can live in a `.env` next to
+`docker-compose.yml` (`env_file: required: false` already allows it).
 
 ### Test mode
 
-For evaluating reconstruction quality against known-good data, add one or
-more `--test-gap START END` pairs. Those rows are replaced with NaN *in memory*
-before imputation; the source (CSV file or Cassandra cluster) is never modified.
+To measure reconstruction quality against known-good data, pass one or more
+`--test-gap START END` pairs. The matching rows are replaced with NaN in
+memory before imputation runs; neither the source CSV nor the Cassandra
+cluster is modified.
 
 ```bash
 CASSANDRA_HOSTS=10.64.253.10 docker compose run --rm imputer impute_cli.py \
@@ -125,18 +120,19 @@ CASSANDRA_HOSTS=10.64.253.10 docker compose run --rm imputer impute_cli.py \
     --plot /io/plot.png
 ```
 
-- Bounds are naive Europe/Paris times, inclusive on both ends.
-- `--test-gap` is repeatable.
-- `--test-report PATH` writes one row per masked point with `timestamp`,
-  `ground_truth`, `imputed`, `quality`, `abs_error`, then summary metrics
-  (`# MAE=...`, `# RMSE=...`, `# max_err=...`) as footer comments. The stdout
-  also gets a one-line `[TEST] ...` summary.
-- When `--plot` is combined with `--test-gap`, each masked range shows up as
-  a translucent grey band on the PNG.
-- A range fully outside the 7-day window is a hard error. One partially
-  outside gets clipped with a warning. Masking the entire window is only
-  allowed in Cassandra mode (where the 56-day history gives context); in CSV
-  mode it's a hard error.
+Bounds are naive Europe/Paris times, inclusive on both ends, and `--test-gap`
+is repeatable. `--test-report PATH` writes one row per masked point
+(`timestamp`, `ground_truth`, `imputed`, `quality`, `abs_error`) plus summary
+metrics (`# MAE=...`, `# RMSE=...`, `# max_err=...`) as footer comments; a
+one-line `[TEST] ...` summary also goes to stdout.
+
+Combining `--plot` with `--test-gap` draws each masked range as a translucent
+grey band on the PNG.
+
+A range fully outside the 7-day window is a hard error; a partially outside
+range is clipped with a warning. Masking the entire window is only permitted
+in Cassandra mode, because the 56-day history still provides context; CSV
+mode rejects it.
 
 ## I/O contract
 
@@ -147,25 +143,24 @@ CASSANDRA_HOSTS=10.64.253.10 docker compose run --rm imputer impute_cli.py \
 | `timestamp` | string | ISO 8601. Tz-aware or naive (naive treated as UTC).                  |
 | `value`     | float  | `Ptot_HA` consumption in watts. Empty / NaN for gaps.                |
 
-Rules the CLI enforces:
-
-- Exactly 1008 rows (7 days x 144 points/day at 10 min).
-- Timestamps strictly increasing, on a 10-min grid (1-second tolerance).
-- At least one non-NaN value.
+The CLI checks three things up front: exactly 1008 rows (7 days x 144 points
+at 10-min intervals), strictly increasing timestamps on a 10-min grid with a
+1-second tolerance, and at least one non-NaN value.
 
 ### Cassandra mode input
 
-No input file. Reads from the tables listed in `Imputation-Module/src/config.py`:
+No input file. The module reads from the tables in
+`Imputation-Module/src/config.py`:
 
 - `conso_historiques_clean` (partition key `Conso_Data`)
 - `pv_prev_meteo_clean` (partition key `Meteorological_Prevision_Data`)
 
-The 7-day window is reindexed onto a full 10-min grid, so any rows missing in
-Cassandra become NaN gaps the imputer can actually see.
+The 7-day window is reindexed onto a full 10-min grid, so rows missing from
+Cassandra show up as NaN gaps and are handled by the imputer.
 
 ### Output CSV
 
-Same shape either way:
+Same shape in either mode:
 
 | Column      | Type   | Notes                                                                |
 |-------------|--------|----------------------------------------------------------------------|
@@ -192,16 +187,16 @@ Same shape either way:
 | `./io/`    | `/io/`         | rw   |
 | `./cache/` | `/app/cache/`  | rw   |
 
-The CSVs under `/data/` feed the CSV-mode 56-day history prepend. In Cassandra
-mode the 56-day context comes from the same pull as the 7-day window, and the
-CSVs are only consulted if the Cassandra pull is empty.
+The CSVs under `/data/` provide the 56-day history in CSV mode. In Cassandra
+mode that same 56-day context is pulled alongside the 7-day window, and the
+CSVs are only read as a fallback when the Cassandra pull is empty.
 
-`./cache/` persists `hybrid_templates_cache.pkl` so the engine doesn't rebuild
-seasonal templates on every run.
+`./cache/` persists `hybrid_templates_cache.pkl` so seasonal templates don't
+need to be rebuilt on every run.
 
 ## Env vars
 
-Paths inside the container:
+Container paths:
 
 - `IMPUTER_DATA_DIR=/data`
 - `IMPUTER_RECENT_HA_CSV=/data/Cons_Hotel Academic_2026-03-22_2026-04-10.csv`
@@ -214,6 +209,6 @@ Cassandra connection (defaults in parens):
 - `CASSANDRA_PASSWORD` (empty)
 - `CASSANDRA_KEYSPACE` (`previsions_data`)
 
-Override any of them on the command line (`-e VAR=value`), via the shell
-environment (compose picks them up), or through a `.env` next to
+All of these can be overridden on the command line (`-e VAR=value`), from the
+shell environment (compose picks them up), or through a `.env` next to
 `docker-compose.yml`.

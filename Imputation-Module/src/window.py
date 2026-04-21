@@ -34,7 +34,7 @@ def extract_window(df, target_date, weather_df, building_column=None):
     history = df.loc[hist_mask].copy()
 
     # Cassandra rows are sparse (missing timestamps have no row at all); reindex
-    # onto a full 10-min grid so the imputer can actually see the NaNs.
+    # onto a full 10-min grid so the imputer sees the NaNs.
     full_grid = pd.date_range(
         history_start_utc, periods=LOOKBACK_POINTS, freq="10min", tz="UTC"
     )
