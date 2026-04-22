@@ -346,6 +346,7 @@ class ExtendedDeploymentAlgorithm:
                     'kalman': self.use_kalman,
                     'knn': self.use_knn,
                     'multi_week_templates': self.use_multi_week_templates,
+                    'seasonal_templates': self.use_multi_week_templates,  # Seasonal templates built when multi_week_templates enabled
                     'chunked_recovery': self.use_chunked_recovery,
                     'smart_chunking': self.use_smart_chunking,
                 },
@@ -380,6 +381,8 @@ class ExtendedDeploymentAlgorithm:
         is_chunk: bool = False,
         chunk_index: Optional[int] = None,
         zero_fill_corrected: bool = False,
+        template_type: Optional[str] = None,
+        thermal_regime: Optional[str] = None,
     ):
         """
         Append a fully-detailed gap record to the audit log.
@@ -451,6 +454,8 @@ class ExtendedDeploymentAlgorithm:
                 'is_chunk': is_chunk,
                 'chunk_index': chunk_index,
                 'zero_fill_corrected': zero_fill_corrected,
+                'template_type': template_type or 'unknown',  # seasonal | weekly | unknown
+                'thermal_regime': thermal_regime,  # Cold | Mild | Hot | None
                 'routing_trace': routing_trace,
                 'inputs_used': {
                     'template_values': template_inputs_used,
@@ -884,6 +889,11 @@ class ExtendedDeploymentAlgorithm:
         # ── NEW v2: initialise audit log (after tz conversion) ───────────────
         self._init_audit_log(df)
 
+        # Remove any duplicate timestamps to avoid reindex errors
+        if df['Timestamp'].duplicated().any():
+            log.warning(f"[WARN] Found {df['Timestamp'].duplicated().sum()} duplicate timestamps; keeping first occurrence")
+            df = df.drop_duplicates(subset=['Timestamp'], keep='first').reset_index(drop=True)
+
         # Reindex to complete 10-min grid (tz-aware)
         start = df['Timestamp'].min().floor('10min')
         end = df['Timestamp'].max().ceil('10min')
@@ -918,9 +928,9 @@ class ExtendedDeploymentAlgorithm:
         # Build lookups
         self._build_peer_ratios(df)
         self._build_day_specific_templates(df)
-        self._build_seasonal_templates(df)
         if self.use_multi_week_templates:
             self._build_weekly_templates(df)
+            self._build_seasonal_templates(df)  # Build seasonal templates after weekly (uses same adaptive approach)
             self._build_uncertainty_bounds(df)
         self._build_multi_site_correlations(df)
 
@@ -1098,6 +1108,112 @@ class ExtendedDeploymentAlgorithm:
 
         log.debug(f"[SMART-CHUNK] {len(chunks)} chunks, high-var threshold: {v_threshold:.1f}")
         return chunks
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Seasonal template helpers and fill
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _get_seasons_in_gap(self, df: pd.DataFrame, gap_start: int, gap_end: int) -> List[str]:
+        """Extract unique seasons present in the gap (ordered)."""
+        if 'Season' not in df.columns:
+            return []
+        seasons = df.loc[gap_start:gap_end - 1, 'Season'].unique().tolist()
+        return list(dict.fromkeys(seasons))  # preserve order, remove duplicates
+
+    def _get_thermal_regime_in_gap(self, df: pd.DataFrame, gap_start: int, gap_end: int) -> Optional[str]:
+        """Extract the most common ThermalRegime in the gap (Cold/Mild/Hot)."""
+        if 'ThermalRegime' not in df.columns:
+            return None
+        regimes = df.loc[gap_start:gap_end - 1, 'ThermalRegime'].value_counts()
+        return regimes.index[0] if len(regimes) > 0 else None
+
+    def _get_thermal_confidence_adjustment(self, df: pd.DataFrame, gap_start: int, gap_end: int,
+                                            season: Optional[str], thermal_regime: Optional[str]) -> float:
+        """
+        Compute a small confidence adjustment (0.95-1.05) based on thermal regime match.
+        If thermal regime in gap doesn't match season expectations, slightly penalize confidence.
+        """
+        if season is None or thermal_regime is None:
+            return 1.0
+
+        # Define expected thermal regimes for each season (heuristic)
+        expected_regimes = {
+            'winter': ['Cold', 'Mild'],
+            'spring': ['Mild', 'Hot'],
+            'summer': ['Hot', 'Mild'],
+            'fall': ['Mild', 'Cold'],
+        }
+        expected = expected_regimes.get(season, ['Mild'])
+        if thermal_regime in expected:
+            return 1.0  # match: no adjustment
+        else:
+            return 0.95  # slight penalty for mismatch
+
+    def _fill_with_seasonal_template(self, df: pd.DataFrame, site: str, gap_start: int, gap_end: int,
+                                      season: str, thermal_regime: Optional[str] = None) -> bool:
+        """
+        Fill gap using seasonal templates. Returns True if successful.
+        Falls back to weekly template if seasonal data is insufficient.
+        """
+        try:
+            hours = df.loc[gap_start:gap_end - 1, 'Hour'].values
+            day_names = df.loc[gap_start:gap_end - 1, 'DayOfWeek'].values
+            filled_vals = []
+            confidences = []
+
+            for h, day_name in zip(hours, day_names):
+                # Try seasonal template first
+                seasonal_dict = self._seasonal_templates.get(site, {}).get(season, {}).get(day_name, {})
+                tmpl = seasonal_dict.get(h) if seasonal_dict else None
+
+                if tmpl is not None:
+                    filled_vals.append(tmpl['median'])
+                    conf = (1.0 / (1.0 + tmpl['std'] / (tmpl['median'] + 1e-6))
+                            if tmpl['std'] > 0 else 1.0)
+                    # Apply thermal regime adjustment
+                    conf = conf * self._get_thermal_confidence_adjustment(df, gap_start, gap_end, season, thermal_regime)
+                    confidences.append(conf)
+                else:
+                    # Fall back to weekly template for this cell
+                    weekly_dict = self._weekly_templates.get(site, {}).get(day_name, {})
+                    tmpl_weekly = weekly_dict.get(h)
+                    if tmpl_weekly is not None:
+                        filled_vals.append(tmpl_weekly['median'])
+                        conf = (1.0 / (1.0 + tmpl_weekly['std'] / (tmpl_weekly['median'] + 1e-6))
+                                if tmpl_weekly['std'] > 0 else 1.0)
+                        confidences.append(conf * 0.95)  # slight penalty for fallback
+                    else:
+                        # All else fails: use hourly median
+                        mask = (df['Hour'] == h) & df[site].notna()
+                        if mask.any():
+                            filled_vals.append(float(df.loc[mask, site].median()))
+                            confidences.append(0.5)
+                        else:
+                            filled_vals.append(np.nan)
+                            confidences.append(0.0)
+
+            filled_vals = self._validate_and_clip(np.array(filled_vals), site, df)
+            df.loc[gap_start:gap_end - 1, site] = filled_vals
+
+            avg_conf = float(np.nanmean(confidences)) if confidences else 0.0
+            self._reconstruction_confidence[f'{site}_{gap_start}_{gap_end}'] = avg_conf
+
+            if avg_conf < 0.5:
+                self._low_confidence_flags.append({
+                    'site': site, 'gap_start': gap_start, 'gap_end': gap_end,
+                    'confidence': avg_conf, 'reason': 'seasonal_template_low_confidence',
+                })
+
+            self.strategy_log.append({
+                'site': site, 'gap_start': gap_start, 'gap_end': gap_end,
+                'gap_size': gap_end - gap_start, 'strategy': f'SEASONAL_TEMPLATE_{season.upper()}',
+                'confidence': avg_conf,
+            })
+
+            return True
+        except Exception as e:
+            log.error(f"[ERROR] _fill_with_seasonal_template ({site}): {e}")
+            return False
 
     # ─────────────────────────────────────────────────────────────────────────
     # Multi-week template building
@@ -1433,8 +1549,15 @@ class ExtendedDeploymentAlgorithm:
                     return
                 routing_trace.append('SKIP: parent has no data in gap window')
 
-        # Rule-based by size
-        if gap_size <= 3:
+        # Check for weekend gaps FIRST (before size-based routing)
+        if self._is_pure_weekend_gap(df, gap_start, gap_end):
+            day_type = self._get_weekend_day_type(df, gap_start, gap_end)
+            routing_trace.append(f'BRANCH: WEEKEND_TEMPLATE ({day_type})')
+            self._fill_weekend_template(df, site, gap_start, gap_end, day_type)
+            _log_and_record(f'WEEKEND_TEMPLATE_{day_type.upper()}')
+            return
+        # Rule-based by size (for non-weekend gaps)
+        elif gap_size <= 3:
             routing_trace.append('BRANCH: LINEAR_MICRO (size<=3)')
             self._fill_linear(df, site, gap_start, gap_end)
             _log_and_record('LINEAR_MICRO')
@@ -1442,15 +1565,46 @@ class ExtendedDeploymentAlgorithm:
             routing_trace.append('BRANCH: LINEAR_SHORT (size<=18)')
             self._fill_linear(df, site, gap_start, gap_end)
             _log_and_record('LINEAR_SHORT')
-        elif self._is_pure_weekend_gap(df, gap_start, gap_end):
-            day_type = self._get_weekend_day_type(df, gap_start, gap_end)
-            routing_trace.append(f'BRANCH: WEEKEND_TEMPLATE ({day_type})')
-            self._fill_weekend_template(df, site, gap_start, gap_end, day_type)
-            _log_and_record(f'WEEKEND_TEMPLATE_{day_type.upper()}')
         elif not is_entry and gap_size <= STEPS_PER_DAY:
-            routing_trace.append('BRANCH: THERMAL_TEMPLATE (non-entry, <=1 day)')
-            self._fill_with_thermal_template(df, site, gap_start, gap_end)
-            _log_and_record('THERMAL_TEMPLATE')
+            # Try seasonal templates first, then fall back to weekly/thermal
+            seasons_in_gap = self._get_seasons_in_gap(df, gap_start, gap_end)
+            thermal_regime = self._get_thermal_regime_in_gap(df, gap_start, gap_end)
+            seasonal_filled = False
+
+            if seasons_in_gap and self._seasonal_templates and self._seasonal_templates.get(site):
+                for season in seasons_in_gap:
+                    routing_trace.append(f'TRY: SEASONAL_TEMPLATE_{season.upper()}')
+                    if self._fill_with_seasonal_template(df, site, gap_start, gap_end, season, thermal_regime):
+                        if not np.isnan(df.loc[gap_start:gap_end - 1, site].values).all():
+                            routing_trace.append(f'SELECTED: SEASONAL_TEMPLATE_{season.upper()} (thermal_regime={thermal_regime})')
+                            day_type = 'weekday' if not is_weekend else self._get_weekend_day_type(df, gap_start, gap_end)
+                            occ = df.loc[gap_start, 'OccupancyType'] if 'OccupancyType' in df.columns else None
+                            hol = bool(df.loc[gap_start, 'IsHoliday']) if 'IsHoliday' in df.columns else False
+                            conf = self._calculate_confidence_with_uncertainty(site, gap_size, f'SEASONAL_TEMPLATE_{season.upper()}', day_type, occ, hol)
+                            conf = conf * self._get_thermal_confidence_adjustment(df, gap_start, gap_end, season, thermal_regime)
+                            self._reconstruction_confidence[f'{site}_{gap_start}_{gap_end}'] = conf
+                            self._flag_low_confidence(df, site, gap_start, gap_end, conf, f'SEASONAL_TEMPLATE_{season.upper()}')
+                            self._record_gap(df, site, gap_start, gap_end, f'SEASONAL_TEMPLATE_{season.upper()}', conf, routing_trace,
+                                           is_chunk=(chunk_index is not None), chunk_index=chunk_index,
+                                           zero_fill_corrected=zero_fill_correction, template_type='seasonal',
+                                           thermal_regime=thermal_regime)
+                            seasonal_filled = True
+                            return
+                    routing_trace.append(f'FAIL: SEASONAL_TEMPLATE_{season.upper()}')
+
+            if not seasonal_filled:
+                routing_trace.append('BRANCH: THERMAL_TEMPLATE (fallback, non-entry, <=1 day)')
+                self._fill_with_thermal_template(df, site, gap_start, gap_end)
+                day_type = 'weekday' if not is_weekend else self._get_weekend_day_type(df, gap_start, gap_end)
+                occ = df.loc[gap_start, 'OccupancyType'] if 'OccupancyType' in df.columns else None
+                hol = bool(df.loc[gap_start, 'IsHoliday']) if 'IsHoliday' in df.columns else False
+                conf = self._calculate_confidence_with_uncertainty(site, gap_size, 'THERMAL_TEMPLATE', day_type, occ, hol)
+                self._reconstruction_confidence[f'{site}_{gap_start}_{gap_end}'] = conf
+                self._flag_low_confidence(df, site, gap_start, gap_end, conf, 'THERMAL_TEMPLATE')
+                self._record_gap(df, site, gap_start, gap_end, 'THERMAL_TEMPLATE', conf, routing_trace,
+                               is_chunk=(chunk_index is not None), chunk_index=chunk_index,
+                               zero_fill_corrected=zero_fill_correction, template_type='weekly',
+                               thermal_regime=thermal_regime)
         elif not is_entry:
             routing_trace.append('BRANCH: ENHANCED_TEMPLATE (non-entry, >1 day)')
             self._fill_enhanced_template(df, site, gap_start, gap_end)
@@ -1682,9 +1836,69 @@ class ExtendedDeploymentAlgorithm:
                     self.templates['holiday'][site] = df.loc[mask].groupby('Hour')[site].median().to_dict()
 
     def _build_seasonal_templates(self, df: pd.DataFrame):
-        for site in self.site_cols:
-            if site in df.columns:
+        """
+        Build seasonal templates as refinement of weekly templates.
+        Structure: self._seasonal_templates[site][(season, day, hour)] = {median, std, etc.}
+        Falls back to weekly templates if seasonal data is insufficient.
+        """
+        try:
+            MIN_SEASONAL_SAMPLES = 5  # require at least 5 samples per season-day-hour cell
+            max_date = df['Timestamp'].max()
+            min_date = max_date - pd.Timedelta(days=self.template_lookback_days)
+            recent_cutoff = max_date - pd.Timedelta(
+                days=int(self.template_lookback_days * self.adaptive_template_bias)
+            )
+
+            for site in self.site_cols:
+                if site not in df.columns:
+                    continue
                 self._seasonal_templates[site] = {}
+
+                for season in ['winter', 'spring', 'summer', 'fall']:
+                    season_templates = {}
+                    for day_name in ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']:
+                        day_templates = {}
+                        for hour in range(24):
+                            # Segment by season and day-of-week
+                            season_mask = (df['Season'] == season) & (df['DayOfWeek'] == day_name) & (df['Hour'] == hour) & df[site].notna()
+                            season_vals = df.loc[season_mask, site].values
+
+                            if len(season_vals) >= MIN_SEASONAL_SAMPLES:
+                                day_templates[hour] = {
+                                    'median': float(np.median(season_vals)),
+                                    'mean': float(np.mean(season_vals)),
+                                    'std': float(np.std(season_vals)),
+                                    'q25': float(np.percentile(season_vals, 25)),
+                                    'q75': float(np.percentile(season_vals, 75)),
+                                    'count': int(len(season_vals)),
+                                }
+                            else:
+                                day_templates[hour] = None
+
+                        season_templates[day_name] = day_templates
+                    self._seasonal_templates[site][season] = season_templates
+
+            # Count how many season-day-hour cells were populated
+            total_cells = 0
+            populated_cells = 0
+            for site in self.site_cols:
+                if site in self._seasonal_templates:
+                    for season_dict in self._seasonal_templates[site].values():
+                        for day_dict in season_dict.values():
+                            for h in day_dict:
+                                total_cells += 1
+                                if h is not None and day_dict[h] is not None:
+                                    populated_cells += 1
+
+            if populated_cells > 0:
+                coverage = float(populated_cells) / float(total_cells) * 100 if total_cells > 0 else 0
+                log.info(f"[SEASONAL] Built seasonal templates: {populated_cells}/{total_cells} cells populated ({coverage:.1f}%)")
+            else:
+                log.info(f"[SEASONAL] Insufficient seasonal data; templates will fall back to weekly")
+
+        except Exception as e:
+            log.error(f"[ERROR] _build_seasonal_templates: {e}")
+            self._seasonal_templates = {site: {} for site in self.site_cols}
 
     def _build_peer_ratios(self, df: pd.DataFrame):
         for site, info in METER_HIERARCHY.items():
