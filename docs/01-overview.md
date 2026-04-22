@@ -2,119 +2,81 @@
 
 ## 1.1 What this project is
 
-Project N°28 is an R&D deliverable inside the **LiveTree demonstrator** at JUNIA (Lille, France). The demonstrator is a physical set of campus buildings instrumented with electrical meters, a Cassandra database that stores their consumption history, and a Kafka bus that broadcasts forecasts to downstream consumers (dashboards, energy-management services).
+This repository is the *module de pilotage*, the steering module of a day-ahead electricity-consumption forecasting system for JUNIA's LiveTree demonstrator campus in Lille, France. It is part of Project N°28, *"Amélioration de la résilience des modèles prédictifs par la qualité et la continuité des données"*.
 
-At the core of the demonstrator is a **day-ahead electricity consumption forecaster**: every morning it publishes 144 predicted values (one every 10 minutes, 24 hours of coverage) for each monitored building.
+Four buildings on the campus are instrumented with electrical meters that publish a power reading every ten minutes into a Cassandra cluster. A forecasting service in a separate system reads the last seven days of those readings (exactly 1008 points per building: 7 × 144) and produces a 24-hour-ahead forecast. The forecaster does not tolerate gaps in its input. A single missing row is enough to block the prediction entirely.
 
-Project N°28 has two responsibilities:
+The acquisition chain is not reliable enough to guarantee a gap-free seven-day window. Sensors drop out, network links fail, and multi-hour outages are routine. This module sits between the raw Cassandra table and the forecaster: it takes a seven-day window with holes, returns a complete one, and tags every point with a quality flag so downstream consumers can decide how much to trust each value.
 
-1. **Keep the forecaster producing, even when the acquisition chain breaks.** A single missing row in the 7-day input window used to be enough to stall predictions. The imputation module bridges those gaps.
-2. **Explain every value that is published.** Each imputed point carries a quality flag and a routed strategy so operators can tell synthetic data apart from real measurements.
+The data flow is a straight line, left to right:
+
+```
+Building sensors  ->  Cassandra                   ->  This repo          ->  Cassandra                          ->  Downstream forecaster
+(10-min readings)     (conso_historiques_clean)       (Imputation Module     (conso_historiques_reconstructed)      (separate system,
+                                                       nightly 23:50                                                 out of scope)
+                                                       Europe/Paris)
+```
+
+The downstream forecaster lives in a different repository and runs as a separate container. Its model, Kafka publisher, and scheduler are not in this repo and are not documented here.
 
 ## 1.2 Why it exists
 
-The input to the prediction model is the **last 7 days of 10-minute-interval consumption** — that is 144 × 7 = **1008 data points** per building. In production this window is assembled from Cassandra once per day.
+The forecaster's input is rigid: exactly 1008 rows per building, on a 10-minute grid, strictly increasing, covering the seven days ending yesterday (the forecast is for tomorrow), with no NaNs anywhere.
 
-Real-world observations over the past year showed:
+The legacy pipeline solved this by dropping any window with more than about 150 missing rows and doing naive linear interpolation on the rest. So whole days of the forecast were silently skipped whenever the acquisition chain had a bad night, and even on the windows that did make it through, linear interpolation across a multi-hour gap that straddles a weekend, a holiday, or a sharp thermal transition produces a shape that has nothing to do with the building's actual consumption pattern.
 
-- Sensors or network links drop out for **minutes to days**.
-- The legacy pipeline rejected any window containing fewer than 850 valid rows.
-- When it ran anyway, it used a naive linear interpolation that breaks down on multi-hour gaps spanning weekends, holidays, or sharp weather transitions.
-
-The imputation module fixes both problems by (a) reconstructing any gap size from 1 point up to the full 1008-point window and (b) routing each gap to the strategy that best matches its context (day-of-week, occupancy, season, thermal regime, peer meter availability).
+This module replaces both behaviours. It reconstructs any gap size from one missing point up to the entire 1008-point window, and it routes each gap to a strategy that matches its context: day of the week, occupancy, outside temperature, which sibling buildings are intact, whether a recent donor day is available.
 
 ## 1.3 What it produces
 
-Per building, per day:
+For each building, for each nightly run, the module writes a 1008-row reconstructed window (with `value` and `quality` columns) to Cassandra `conso_historiques_reconstructed` and to a CSV at `/io/reconstructed_<building>_<target_date>.csv`. A matching PNG overlay at `/io/reconstructed_<building>_<target_date>.png` is produced when `--plot` is passed. A per-run audit log lands as JSON under `/io/audit_logs/`.
 
-| Artefact | Rows | Columns | Destination |
-|----------|------|---------|-------------|
-| Reconstructed 7-day window | 1008 | `timestamp`, `value`, `quality` | Cassandra table `conso_historiques_reconstructed` + CSV at `/io/reconstructed_<building>_<date>.csv` |
-| Optional overlay plot | — | — | PNG at `/io/reconstructed_<building>_<date>.png` |
-| Audit log | — | JSON | `/io/audit_logs/imputation_audit_<run-id>.json` |
-| Day-ahead consumption forecast | 144 × 5 buildings | `Ptot_HA_Forecast`, `Ptot_HEI_13RT_Forecast`, `Ptot_HEI_5RNS_Forecast`, `Ptot_RIZOMM_Forecast`, `Ptot_Ilot_Forecast`, `Date` | Kafka topic `CONSO_Prevision_Data` (Avro) |
+Each row in the output carries a quality flag describing how its value was obtained:
 
-Quality flags are:
+| Flag | Meaning |
+|---|---|
+| `0` | Real measurement, not imputed |
+| `1` | Linear interpolation (short gap) |
+| `2` | Contextual fill (templates, peer correlation, safe-median blend) |
+| `3` | Donor-day ensemble or ML fallback (long gap) |
 
-- `0` — real measurement, left untouched.
-- `1` — filled by linear interpolation (short gap).
-- `2` — filled by a contextual strategy (template, peer correlation, safe-median blend).
-- `3` — filled by an ML-derived or multi-week donor-day strategy (MICE, Kalman, KNN, multi-week template, safe median).
+Downstream consumers typically filter on `quality ≤ 1` for high-confidence analysis, relax to `quality ≤ 2` when they trust the contextual templates, and treat `quality = 3` as a plausible shape rather than a measurement. The authoritative mapping from internal strategy names to flags is `_STRATEGY_FLAG_MAP` in `Imputation-Module/src/imputer.py`, reproduced in [`03-data-model.md`](03-data-model.md).
 
 ## 1.4 Buildings covered
 
-```mermaid
-graph TD
-    Campus["Ptot_Campus — virtual, sum of siblings"]
-    HA["Ptot_HA — Hôtel Académique"]
-    RIZOMM["Ptot_RIZOMM — RIZOMM building"]
-    HEI["Ptot_HEI — HEI aggregate (reference only)"]
-    HEI13["Ptot_HEI_13RT — 13 Rue de Toul"]
-    HEI5["Ptot_HEI_5RNS — 5 Rue Nicolas Souriau"]
+Five columns go through the pipeline: four physical buildings plus one virtual aggregate.
 
-    Campus --> HA
-    Campus --> RIZOMM
-    Campus --> HEI13
-    Campus --> HEI5
-    HEI --> HEI13
-    HEI --> HEI5
-
-    classDef entry fill:#e8f4ff,stroke:#1565c0,color:#0d47a1;
-    classDef sub fill:#fff4e5,stroke:#ef6c00,color:#e65100;
-    classDef virt fill:#f3e5f5,stroke:#6a1b9a,color:#4a148c;
-
-    class HA,RIZOMM entry;
-    class HEI13,HEI5 sub;
-    class Campus,HEI virt;
+```
+Ptot_Campus  (virtual: sum of the four physical meters below)
+│
+|--- Ptot_HA         Hôtel Académique
+|--- Ptot_HEI_13RT   13 Rue de Toul
+|--- Ptot_HEI_5RNS   5 Rue Nicolas Souriau
+|--- Ptot_RIZOMM     RIZOMM building
 ```
 
-- **Entry meters** (blue): top-of-building meters with no parent. They get the strongest routing protection because they anchor the whole hierarchy.
-- **Sub-meters** (orange): sit under a parent. When a sub-meter has a gap but its parent does not, the imputer can reconstruct it from the parent via the learned peer ratio.
-- **Virtual channels** (purple): not stored as their own meter. `Ptot_Campus` is computed at query time as the sum of the four entry/sub-meters. `Ptot_HEI` is only used internally to build the peer ratio for 13RT and 5RNS.
+The four physical meters are `Ptot_HA`, `Ptot_HEI_13RT`, `Ptot_HEI_5RNS`, and `Ptot_RIZOMM`. Each has a column in `conso_historiques_clean` and a corresponding column in the reconstructed output table.
+
+The virtual aggregate is `Ptot_Campus`. It is not stored in the clean table; the imputer materialises it on the fly as the sum of the four physical columns with `skipna=False`. If any component is missing at a given timestamp, the campus total is also missing at that timestamp and gets imputed like any other gap. This is deliberate: it prevents the campus aggregate from silently under-counting one building.
+
+The building list is defined once in `Imputation-Module/src/config.py` as `BUILDINGS`. Every other part of the codebase reads from there.
 
 ## 1.5 Where it runs
 
-```mermaid
-flowchart LR
-    subgraph Cassandra["Cassandra 3-node cluster"]
-        T1["conso_historiques_clean"]
-        T2["pv_prev_meteo_clean"]
-        T3["conso_historiques_reconstructed"]
-    end
+In production, the module runs as a Docker container (`rd_imputer`, Python 3.7 slim) alongside the rest of the LiveTree stack. A long-lived APScheduler daemon wakes once per night at 23:50 Europe/Paris, spawns one CLI subprocess per building, reads the raw seven-day window from Cassandra, runs the imputation, and writes the reconstructed window back to `conso_historiques_reconstructed` plus a CSV (and optional PNG) under `/io/`.
 
-    subgraph Imputer["rd_imputer container (Python 3.7)"]
-        Sched["scheduler.py<br/>nightly 23:50 Europe/Paris"]
-        CLI["impute_cli.py"]
-        Algo["smart_imputation.py"]
-    end
+The container joins an external Docker network (`cassandra_default`, declared as `cassandra_net` with `external: true` in the compose file) that is assumed to already exist on the host. The Cassandra cluster itself is managed outside this project.
 
-    subgraph Predictor["previsions_conso container"]
-        Cons["ConsoFile.py<br/>train: day 15, 05:00 UTC<br/>predict: daily 02:10 UTC"]
-    end
-
-    subgraph Kafka["Kafka 3-broker cluster"]
-        Topic["topic: CONSO_Prevision_Data"]
-        Reg["schema_registry (Avro)"]
-    end
-
-    T1 -->|7-day window| CLI
-    T2 -->|weather| CLI
-    CLI --> Algo
-    Algo -->|1008 reconstructed rows| T3
-    T3 -->|full window| Cons
-    T1 -->|fallback path| Cons
-    T2 -->|forecast temps| Cons
-    Cons -->|144 Avro messages| Topic
-    Reg -.->|validates| Topic
-    Sched --> CLI
-```
-
-Both the imputer and the predictor run as long-lived Docker containers inside the demonstrator's Kafka/Cassandra network. Neither one is exposed to the public internet.
+Locally and for one-off reconstructions, the CLI (`impute_cli.py`) can be invoked directly in either CSV mode (no Cassandra needed) or Cassandra mode. The full run-it-yourself guide is in [`04-usage.md`](04-usage.md).
 
 ## 1.6 Non-goals
 
-The following are explicitly **out of scope** for the imputation module and therefore not documented here:
+The forecasting model itself is out of scope. This repo only produces the input the forecaster needs; the model lives elsewhere.
 
-- Raising sensor faults upstream. Gap detection is reactive: the imputer reconstructs the data it is handed, and writes a correction record when a raw reading is implausible, but it does not trigger maintenance tickets.
-- Retraining the prediction model on reconstructed data. The predictor consumes the reconstructed table, but its training loop runs against the raw `conso_historiques_clean` table to avoid a feedback loop.
-- Real-time streaming. The pipeline is nightly-batch; the unit of work is always a 7-day window.
+Raising sensor-fault tickets upstream is out of scope. Gap detection is reactive: the module reconstructs whatever it is given and records the strategy it used. It does not call out to an alerting system when a sensor dies.
+
+Retraining the forecaster on reconstructed data is out of scope. The forecaster is trained on raw measurements only, to avoid a feedback loop. This module writes to a separate table so the training job can ignore it.
+
+Real-time streaming is out of scope. The pipeline runs once per night, and the unit of work is always a full seven-day window. Sub-minute latency is not a goal.
+
+Multi-site generalisation is out of scope of the current code, which is wired to the five JUNIA building identifiers. See [`07-extending.md`](07-extending.md) for how to adapt it to a different site.
