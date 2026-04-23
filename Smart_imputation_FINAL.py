@@ -1337,8 +1337,8 @@ class ExtendedDeploymentAlgorithm:
     ) -> float:
         strategy_map = {
             'MULTI_WEEK_TEMPLATE': 0.90, 'MICE': 0.85, 'KNN_CONTEXT': 0.80,
-            'KALMAN_FILTER': 0.75, 'PEER_CORRELATION': 0.75, 'THERMAL_TEMPLATE': 0.70,
-            'ENHANCED_TEMPLATE': 0.65, 'WEEKEND_TEMPLATE': 0.60,
+            'KALMAN_FILTER': 0.75, 'PEER_CORRELATION': 0.75, 'SEASONAL_TEMPLATE': 0.68,
+            'THERMAL_TEMPLATE': 0.70, 'ENHANCED_TEMPLATE': 0.65, 'WEEKEND_TEMPLATE': 0.60,
             'LINEAR_SHORT': 0.50, 'SAFE_LINEAR_MEDIAN': 0.45,
             'LINEAR_MICRO': 0.40, 'SAFE_MEDIAN': 0.30,
         }
@@ -1447,6 +1447,11 @@ class ExtendedDeploymentAlgorithm:
             routing_trace.append(f'BRANCH: WEEKEND_TEMPLATE ({day_type})')
             self._fill_weekend_template(df, site, gap_start, gap_end, day_type)
             _log_and_record(f'WEEKEND_TEMPLATE_{day_type.upper()}')
+        elif not is_entry and gap_size <= STEPS_PER_DAY and 'Season' in df.columns and \
+             any(self._seasonal_templates.get(site, {}).get(s, {}) for s in ['winter', 'spring', 'summer', 'fall']):
+            routing_trace.append('BRANCH: SEASONAL_TEMPLATE (non-entry, <=1 day, seasonal data available)')
+            self._fill_with_seasonal_template(df, site, gap_start, gap_end)
+            _log_and_record('SEASONAL_TEMPLATE')
         elif not is_entry and gap_size <= STEPS_PER_DAY:
             routing_trace.append('BRANCH: THERMAL_TEMPLATE (non-entry, <=1 day)')
             self._fill_with_thermal_template(df, site, gap_start, gap_end)
@@ -1489,6 +1494,69 @@ class ExtendedDeploymentAlgorithm:
         except Exception as e:
             log.error(f"[ERROR] _fill_weekend_template ({site}): {e}")
             self._fill_safe_median_template(df, site, gap_start, gap_end)
+
+    def _fill_with_seasonal_template(
+        self, df: pd.DataFrame, site: str, gap_start: int, gap_end: int,
+        chunk_index: Optional[int] = None,
+    ):
+        """
+        Fill gap using seasonal templates: lookup season+hour patterns and use
+        blended seasonal medians.
+        """
+        routing_trace = ['SEASONAL_TEMPLATE_LOOKUP']
+        try:
+            if 'Season' not in df.columns:
+                routing_trace.append('NO_SEASON_COLUMN')
+                self._fill_with_thermal_template(df, site, gap_start, gap_end)
+                return
+
+            hours = df.loc[gap_start:gap_end - 1, 'Hour'].values
+            seasons = df.loc[gap_start:gap_end - 1, 'Season'].values
+            filled_vals = []
+            confidences = []
+
+            for h, season in zip(hours, seasons):
+                tmpl = self._seasonal_templates.get(site, {}).get(season, {}).get(h)
+                if tmpl is not None:
+                    filled_vals.append(tmpl['median'])
+                    conf = (1.0 / (1.0 + tmpl['std'] / (tmpl['median'] + 1e-6))
+                            if tmpl['std'] > 0 else 1.0)
+                    confidences.append(conf)
+                else:
+                    routing_trace.append('HOURLY_MEDIAN_FALLBACK')
+                    mask = (df['Hour'] == h) & df[site].notna()
+                    if mask.any():
+                        filled_vals.append(float(df.loc[mask, site].median()))
+                        confidences.append(0.6)
+                    else:
+                        filled_vals.append(np.nan)
+                        confidences.append(0.0)
+
+            filled_vals = self._validate_and_clip(np.array(filled_vals), site, df)
+            df.loc[gap_start:gap_end - 1, site] = filled_vals
+
+            avg_conf = float(np.nanmean(confidences))
+            self._reconstruction_confidence[f'{site}_{gap_start}_{gap_end}'] = avg_conf
+
+            if avg_conf < 0.5:
+                self._low_confidence_flags.append({
+                    'site': site, 'gap_start': gap_start, 'gap_end': gap_end,
+                    'confidence': avg_conf, 'reason': 'seasonal_template_low_confidence',
+                })
+
+            self.strategy_log.append({
+                'site': site, 'gap_start': gap_start, 'gap_end': gap_end,
+                'gap_size': gap_end - gap_start, 'strategy': 'SEASONAL_TEMPLATE',
+                'confidence': avg_conf,
+            })
+
+            self._record_gap(df, site, gap_start, gap_end, 'SEASONAL_TEMPLATE', avg_conf,
+                             routing_trace, is_chunk=(chunk_index is not None),
+                             chunk_index=chunk_index)
+
+        except Exception as e:
+            log.error(f"[ERROR] _fill_with_seasonal_template ({site}): {e}")
+            self._fill_with_thermal_template(df, site, gap_start, gap_end)
 
     def _fill_with_thermal_template(self, df, site, gap_start, gap_end):
         try:
@@ -1682,9 +1750,85 @@ class ExtendedDeploymentAlgorithm:
                     self.templates['holiday'][site] = df.loc[mask].groupby('Hour')[site].median().to_dict()
 
     def _build_seasonal_templates(self, df: pd.DataFrame):
-        for site in self.site_cols:
-            if site in df.columns:
+        """
+        Build seasonal templates: for each site, season, and hour, compute hourly consumption
+        patterns grouped by season (winter/spring/summer/fall). Uses adaptive template bias
+        to blend recent (70%) and historical (30%) data.
+
+        Returns: self._seasonal_templates[site][season][hour] = {
+            'median': float, 'mean': float, 'std': float, 'q25': float, 'q75': float,
+            'recent_count': int, 'historical_count': int, 'all_values': array
+        }
+        """
+        try:
+            if 'Season' not in df.columns:
+                log.debug("[SEASONAL] No Season column; skipping seasonal templates")
+                return
+
+            max_date = df['Timestamp'].max()
+            min_date = max_date - pd.Timedelta(days=self.template_lookback_days)
+            recent_cutoff = max_date - pd.Timedelta(
+                days=int(self.template_lookback_days * self.adaptive_template_bias)
+            )
+            recent_mask = df['Timestamp'] >= recent_cutoff
+            historical_mask = (df['Timestamp'] >= min_date) & (df['Timestamp'] < recent_cutoff)
+
+            seasons = ['winter', 'spring', 'summer', 'fall']
+
+            for site in self.site_cols:
+                if site not in df.columns:
+                    continue
                 self._seasonal_templates[site] = {}
+
+                for season in seasons:
+                    season_templates = {}
+                    season_values_all = []
+
+                    for hour in range(24):
+                        recent = df.loc[
+                            recent_mask & (df['Season'] == season) &
+                            (df['Hour'] == hour) & df[site].notna(), site
+                        ].values
+                        historical = df.loc[
+                            historical_mask & (df['Season'] == season) &
+                            (df['Hour'] == hour) & df[site].notna(), site
+                        ].values
+
+                        if len(recent) > 0 and len(historical) > 0:
+                            blended = (self.adaptive_template_bias * np.median(recent) +
+                                       (1 - self.adaptive_template_bias) * np.median(historical))
+                            all_values = np.concatenate([recent, historical])
+                        elif len(recent) > 0:
+                            blended = np.median(recent)
+                            all_values = recent
+                        elif len(historical) > 0:
+                            blended = np.median(historical)
+                            all_values = historical
+                        else:
+                            blended = None
+                            all_values = np.array([])
+
+                        if len(all_values) > 0:
+                            season_templates[hour] = {
+                                'median': blended,
+                                'mean': float(np.mean(all_values)),
+                                'std': float(np.std(all_values)),
+                                'q25': float(np.percentile(all_values, 25)),
+                                'q75': float(np.percentile(all_values, 75)),
+                                'recent_count': int(len(recent)),
+                                'historical_count': int(len(historical)),
+                                'all_values': all_values[:100].copy(),
+                            }
+                            season_values_all.extend(all_values)
+                        else:
+                            season_templates[hour] = None
+
+                    self._seasonal_templates[site][season] = season_templates
+
+            log.info(f"[TEMPLATES] Built seasonal templates for {len(self.site_cols)} sites, "
+                     f"4 seasons, 24 hours ({int(self.adaptive_template_bias*100)}% recency bias)")
+        except Exception as e:
+            log.error(f"[ERROR] _build_seasonal_templates: {e}")
 
     def _build_peer_ratios(self, df: pd.DataFrame):
         for site, info in METER_HIERARCHY.items():
