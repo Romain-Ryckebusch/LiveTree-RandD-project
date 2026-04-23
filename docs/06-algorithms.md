@@ -1,208 +1,299 @@
 # 6. Algorithms
 
-How the module actually fills gaps. The engine is `ExtendedDeploymentAlgorithm` in `Imputation-Module/src/smart_imputation.py` (1 964 lines). This chapter walks through the run lifecycle, the routing decision tree, every strategy, and the post-processing steps. For a structural map of where things live in the file, see [`05-file-reference.md`](05-file-reference.md#54-srcsmart_imputationpy).
+How the module actually fills gaps. The engine is `ExtendedDeploymentAlgorithm` in `Imputation-Module/src/smart_imputation.py`. This chapter walks through the run lifecycle, the routing decision tree, every strategy, anomaly detection, post-processing, and the audit log. For a structural map of where things live in the file, see [`05-file-reference.md`](05-file-reference.md).
+
+---
 
 ## 6.1 Run lifecycle (`ExtendedDeploymentAlgorithm.impute`)
 
 One call to `impute(df, weather_df=None)` executes these steps in order:
 
- 1. Input: a DataFrame with a `Timestamp` column and one column per site, possibly containing NaNs.
- 2. Localise timestamps: convert UTC to Europe/Paris.
- 3. If a weather DataFrame was supplied, merge `AirTemp` onto the grid. Otherwise skip.
- 4. Initialise the audit log.
- 5. Reindex to a complete 10-minute grid; rows that were missing from the input become explicit NaNs.
- 6. Feature engineering: add datetime features, occupancy, thermal regime, and external features.
- 7. Detect raw anomalies (pre-fill): scan for zero-fill and stuck-sensor patterns and mark them NaN.
- 8. Build lookups: peer ratios, day-specific, seasonal, and weekly templates, uncertainty bounds, and multi-site correlations.
- 9. For each site, find gap groups (runs of NaNs).
-10. For each gap, dispatch. If the gap size exceeds `chunk_size` and `use_chunked_recovery` is on, call `_fill_chunked_gap`, which splits the gap into smart chunks and routes each chunk. Otherwise call `_intelligent_router`, which picks and runs one strategy.
-11. Run a final NaN guard pass to catch anything missed.
-12. Post-fill zero-fill scan (`_detect_zero_fills`): re-run IsolationForest and re-fill suspicious stretches.
-13. Smooth junctions: Savitzky-Golay filter over fill/real boundaries.
-14. Finalise the audit log and write it to JSON on disk.
-15. Return the completed DataFrame.
+1. **Input** — a DataFrame with a `Timestamp` column and one column per site (`Ptot_HA`, `Ptot_HEI`, `Ptot_HEI_13RT`, `Ptot_HEI_5RNS`, `Ptot_RIZOMM`, `Ptot_Ilot`), possibly containing NaNs.
+2. **Localise timestamps** — convert to `Europe/Paris` (CET/CEST). Naive timestamps are localised directly; UTC-aware timestamps are converted. DST spring-forward and fall-back transitions are detected and logged. See [§6.7](#67-dst-handling).
+3. **Merge weather** — if a weather DataFrame was supplied, merge `AirTemp` onto the grid via a left join on `Timestamp`, then forward-fill. Otherwise skip.
+4. **Initialise audit log** — stamp the run ID, capture the pre-fill NaN counts per site, record the active configuration, and pre-allocate all log sections. See [§6.8](#68-audit-logging).
+5. **Reindex to complete 10-minute grid** — rows missing from the input become explicit NaNs. The grid is tz-aware, anchored at `floor('10min')` of the earliest timestamp.
+6. **Feature engineering** — add `Hour`, `DayOfWeek`, `Date`, `ThermalRegime`, `OccupancyType`, `IsOccupied`, `IsHoliday`, `IsSpecialDay`, `IsHolidayClose`, `IsEventDay`, `WeatherSpike`, and `Season`. Occupancy classification uses France 2026 public holidays by default; a `calendar_data` override is accepted at construction time.
+7. **Detect raw anomalies (pre-fill)** — `_detect_raw_anomalies` scans for stuck-sensor runs, near-zero readings during active hours, and IsolationForest outliers. Flagged points are masked to NaN so they enter the normal fill pipeline rather than contaminating templates. See [§6.4.1](#641-pre-fill-raw-anomalies-_detect_raw_anomalies).
+8. **Build lookups** — peer ratios (`_build_peer_ratios`), day-specific and weekend templates (`_build_day_specific_templates`), seasonal templates (`_build_seasonal_templates`), 28-day adaptive weekly templates (`_build_weekly_templates`), uncertainty bounds (`_build_uncertainty_bounds`), and multi-site correlations (`_build_multi_site_correlations`). Templates are built after anomaly masking so bad values do not skew medians.
+9. **Gap loop** — for each site, `_find_gap_groups` returns the list of contiguous NaN runs as `(gap_start, gap_end)` index pairs.
+10. **Dispatch each gap** — if `use_chunked_recovery` is on and the gap exceeds `gap_chunk_size`, call `_fill_chunked_gap`, which splits the gap into smart chunks and routes each one. Otherwise call `_intelligent_router` directly. Both paths record a full audit entry per gap/chunk via `_record_gap`.
+11. **NaN guard** — `_nan_guard_final_pass` catches anything the main loop left unfilled and applies `_fill_safe_median_template` as a last resort.
+12. **Post-fill zero-fill scan** — `_detect_zero_fills` re-runs IsolationForest over all imputed regions and re-fills any stretches that still look like disconnected-sensor zeros. See [§6.4.2](#642-post-fill-zero-fill-detection-_detect_zero_fills).
+13. **Smooth junctions** — `_smooth_junctions` applies a Savitzky-Golay filter over the boundary between filled and real segments to remove residual discontinuities.
+14. **Finalise and save audit log** — `_finalise_audit_log` writes the run summary and inputs snapshot into the audit structure, then serialises the whole thing to `audit_logs/imputation_audit_{run_id}.json`. See [§6.8](#68-audit-logging).
+15. **Return** — the completed DataFrame, column-filtered to `Timestamp` + site columns + `AirTemp` (if present).
 
-Key file locations: the `impute` method is at line 860; the routing function at line 1379; the template builders are around 1110; the DST detector is at line 272.
+---
 
 ## 6.2 Routing decision tree
 
-`_intelligent_router(df, site, gap_start, gap_end)` picks one strategy per gap. The cascade, in order:
+`_intelligent_router(df, site, gap_start, gap_end)` picks one strategy per gap. The cascade runs in order; the first branch that succeeds owns that gap.
 
 ```
-1. ML cascade: if gap_size > 50 AND meter is not an "entry" tier:
-     try MICE        (if enabled)   -> flag 3
-     try KALMAN      (if enabled)   -> flag 3
-     try KNN_CONTEXT (if enabled)   -> flag 3
+1. ML cascade — fires if gap_size > 50 AND meter tier is not "entry":
+     try MICE         (if use_mice=True)
+     try KALMAN       (if use_kalman=True)
+     try KNN_CONTEXT  (if use_knn=True)
    First success wins. If all fail or all disabled, fall through.
 
-2. Peer correlation: if meter tier == "sub"
+2. Peer correlation — fires if meter tier == "sub"
    AND parent column exists in the frame
    AND parent has at least one non-NaN value inside [gap_start, gap_end):
-     PEER_CORRELATION -> flag 2
+     PEER_CORRELATION
 
 3. Rule-based by size:
-     gap_size <=  3          -> LINEAR_MICRO           -> flag 1    (<= 30 min)
-     gap_size <= 18          -> LINEAR_SHORT           -> flag 1    (<= 3 h)
-     pure weekend gap        -> WEEKEND_TEMPLATE_<day> -> flag 2    (SAT / SUN / MIXED)
-     non-entry, size <= 144  -> THERMAL_TEMPLATE       -> flag 2    (<= 1 day)
-     non-entry, size  > 144  -> ENHANCED_TEMPLATE      -> flag 2    (> 1 day)
-     entry meter, fallback   -> SAFE_LINEAR_MEDIAN     -> flag 2    (anything left on an entry meter)
+     gap_size <=   3  ->  LINEAR_MICRO             (<= 30 min)
+     gap_size <=  18  ->  LINEAR_SHORT             (<= 3 h)
+     pure weekend gap ->  WEEKEND_TEMPLATE_<day>   (SAT / SUN / MIXED)
+     non-entry, size <= 144  ->  THERMAL_TEMPLATE  (<= 1 day)
+     non-entry, size  > 144  ->  ENHANCED_TEMPLATE (> 1 day)
+     entry meter, fallback   ->  SAFE_LINEAR_MEDIAN
 ```
 
-The ML cascade fires before the size-based rules on non-entry meters, so a 500-point gap (about 3.5 days) on `Ptot_HEI_13RT` goes to MICE first, not to `ENHANCED_TEMPLATE`. That is why `ENHANCED_TEMPLATE` is seen less often than the flag-2 tier might suggest.
+The ML cascade fires before the size-based rules for non-entry meters, so a 500-point gap (~3.5 days) on `Ptot_HEI_13RT` goes to MICE first, not to `ENHANCED_TEMPLATE`.
 
-"Pure weekend" means `gap_start` and `gap_end - 1` are both Saturday or Sunday in Europe/Paris and no weekday rows sit in between; `_get_weekend_day_type` returns `SATURDAY`, `SUNDAY`, or `MIXED` (spans Sat into Sun), and the strategy name gets that suffix.
+**Pure weekend** means every row in `[gap_start, gap_end)` falls on a Saturday or Sunday in `Europe/Paris` with no weekday rows in between. `_get_weekend_day_type` returns `SATURDAY`, `SUNDAY`, or `MIXED` (spans Saturday into Sunday), and the strategy name gets that suffix appended.
 
-The entry-meter tier comes from `METER_HIERARCHY` at the top of `smart_imputation.py`: `Ptot_HA` and `Ptot_RIZOMM` are entries, `Ptot_HEI_13RT` and `Ptot_HEI_5RNS` are sub-meters (parent `Ptot_HEI`, which is never consumed as data but only referenced for the hierarchy); `Ptot_HEI` itself is `main` and `Ptot_Campus` is not in the hierarchy.
+**Meter tiers** come from `METER_HIERARCHY` at the top of `smart_imputation.py`:
 
-Every routing decision records a `routing_trace` list into the audit log, so the audit JSON can be replayed to explain why a specific gap got a specific strategy.
+| Site | Tier | Parent |
+|---|---|---|
+| `Ptot_HEI` | `main` | — |
+| `Ptot_HEI_13RT` | `sub` | `Ptot_HEI` |
+| `Ptot_HEI_5RNS` | `sub` | `Ptot_HEI` |
+| `Ptot_HA` | `entry` | — |
+| `Ptot_RIZOMM` | `entry` | — |
 
-`MULTI_WEEK_TEMPLATE` is not called directly from `_intelligent_router`. It runs inside `_fill_chunked_gap` when `use_chunked_recovery` is on and the gap is too long to route as a single unit: each chunk gets routed individually, and the multi-week template is the long-chunk fallback. This is the primary way flag `3` appears under the `MULTI_WEEK_TEMPLATE` name, as opposed to the ML-cascade strategies.
+Entry meters skip the ML cascade and peer correlation entirely; they receive `SAFE_LINEAR_MEDIAN` as the terminal fallback.
 
-`SAFE_MEDIAN` and `HOURLY_MEDIAN_FALLBACK` are ultimate safety nets invoked when a preferred strategy has no material to work with (too few template samples, the parent meter empty, and so on). They are not in the main cascade; they are fallbacks inside specific fill methods.
+**`MULTI_WEEK_TEMPLATE`** is not called from `_intelligent_router` directly. It is the per-chunk strategy inside `_fill_chunked_gap`: when a gap exceeds `gap_chunk_size` and `use_chunked_recovery` is on, the gap is split into smart chunks and each chunk is filled with the 28-day adaptive weekly template. This is the primary path for very long gaps.
+
+**`SAFE_MEDIAN` and `HOURLY_MEDIAN_FALLBACK`** are ultimate safety nets, invoked inside specific fill methods when a preferred strategy has insufficient material (too few template samples, an empty parent meter, and so on). They are not part of the main cascade.
+
+Every routing decision appends to a `routing_trace` list that is saved verbatim in the audit log, so any gap's strategy selection can be reconstructed after the fact.
+
+---
 
 ## 6.3 Fill strategies
 
-Every strategy mutates `df.loc[gap_start:gap_end - 1, site]` in place. They all assume the 10-minute grid is complete and the NaN mask is correct.
+Every strategy mutates `df.loc[gap_start:gap_end - 1, site]` in place. All assume the 10-minute grid is complete and the NaN mask is correct. Filled values are clipped to `[0, site_max × 1.5]` by `_validate_and_clip` before being written.
 
-### 6.3.1 Linear interpolation: `_fill_linear`
+### 6.3.1 Linear interpolation — `_fill_linear`
 
-Emits `LINEAR_MICRO` (gap of 3 steps or fewer) or `LINEAR_SHORT` (gap of 18 steps or fewer). Flag 1.
+Emits `LINEAR_MICRO` (≤ 3 steps) or `LINEAR_SHORT` (≤ 18 steps).
 
-Draws a straight line between `df.loc[gap_start - 1]` and `df.loc[gap_end]`. Falls back gracefully if either boundary is itself NaN by walking outward to find the nearest real value.
+Draws a straight line between `df.loc[gap_start - 1]` and `df.loc[gap_end]`. If either boundary is itself NaN, it walks outward to the nearest real value. Building consumption over a 30-minute to 3-hour window is well-approximated by a segment, so heavier machinery is not warranted.
 
-Used by the size-based branch for gaps up to 3 hours. The shape of a building's consumption over a 3-hour window is well approximated by a segment, so there is no point bringing heavier machinery in.
+### 6.3.2 Weekend template — `_fill_weekend_template`
 
-### 6.3.2 Weekend template: `_fill_weekend_template`
+Emits `WEEKEND_TEMPLATE_SATURDAY`, `WEEKEND_TEMPLATE_SUNDAY`, or `WEEKEND_TEMPLATE_MIXED`.
 
-Emits `WEEKEND_TEMPLATE_SATURDAY`, `WEEKEND_TEMPLATE_SUNDAY`, or `WEEKEND_TEMPLATE_MIXED`. Flag 2.
+Looks up the median `(day-of-week, hour-of-day)` profile built by `_build_day_specific_templates` and applies it directly. Weekend patterns differ sharply from weekdays (offices closed, labs idle), so a dedicated template avoids contaminating weekday medians.
 
-Looks up the median `(day-of-week, hour-of-day)` profile from `_build_day_specific_templates` and uses it directly. Weekend patterns are strongly different from weekdays (offices closed, labs idle), so building a separate median avoids contaminating weekday templates with weekend data.
+### 6.3.3 Thermal template — `_fill_with_thermal_template`
 
-Triggered when the entire gap falls within a Saturday, a Sunday, or both. Mixed weekends (the gap spans Sat into Sun) get the `_MIXED` suffix.
+Emits `THERMAL_TEMPLATE`.
 
-### 6.3.3 Thermal template: `_fill_with_thermal_template`
+Uses thermal-regime-conditioned hourly medians. The regime (`Cold`, `Mild`, `Hot`) at gap time is read from `ThermalRegime`; the matching `(regime, day-of-week, hour)` cell is used. Captures heating and cooling load shape without needing explicit occupancy data. Applied to sub-day, non-entry gaps when peer correlation is unavailable.
 
-Emits `THERMAL_TEMPLATE`. Flag 2.
+### 6.3.4 Enhanced template — `_fill_enhanced_template`
 
-Uses thermal-regime-conditioned templates built in `_classify_thermal_regimes` and `_build_day_specific_templates`. The regime at gap time is determined from the `AirTemp` series, and the template matching that `(regime, day-of-week, hour)` cell gets pulled.
+Emits `ENHANCED_TEMPLATE`.
 
-Used for sub-day, non-entry gaps when a peer-correlation fill was not available. Captures the heating and cooling-load shape without needing to know the occupancy explicitly.
+Blends the `(day-of-week, hour)` median with the thermal template over a multi-day window. Used for gaps longer than one day on non-entry meters when the ML cascade was not applicable or failed.
 
-### 6.3.4 Enhanced template: `_fill_enhanced_template`
+### 6.3.5 Safe linear median — `_fill_safe_linear_median`
 
-Emits `ENHANCED_TEMPLATE`. Flag 2.
+Emits `SAFE_LINEAR_MEDIAN`.
 
-A multi-day template fill that blends the `(day-of-week, hour)` median with the thermal template over a multi-day window. Used when the gap exceeds 1 day but the ML cascade is not applicable (an entry meter with ML disabled, or a non-entry where ML failed and the size-based rule fell through).
+Blends linear interpolation with an hourly-median correction drawn from recent history (weight 90% linear, 10% median). The terminal fallback for entry meters, which have no peer.
 
-### 6.3.5 Safe linear median: `_fill_safe_linear_median`
+### 6.3.6 Safe median template — `_fill_safe_median_template`
 
-Emits `SAFE_LINEAR_MEDIAN`. Flag 2.
+Emits `SAFE_MEDIAN`.
 
-A blend of linear interpolation with an hourly-median correction from the recent weeks. Used as the final fallback for entry meters, which do not have a peer.
+Pure hourly-median fill from the available history. Invoked as an ultimate safety net inside other methods when no template or peer can produce a better shape, and by `_nan_guard_final_pass` for any values that remain NaN after the main loop.
 
-### 6.3.6 Safe median template: `_fill_safe_median_template`
+### 6.3.7 Peer correlation — `_fill_via_peer_correlation`
 
-Emits `SAFE_MEDIAN_TEMPLATE`. Flag 2 by default (the `_STRATEGY_FLAG_MAP` currently has no entry for this literal name, so `_flag_for_strategy`'s fallback kicks in).
+Emits `PEER_CORRELATION`.
 
-A pure hourly-median fill from the 56-day prepend. Safety net for cases where no template or peer can produce a better shape.
+Applies `child = parent × ratio`, where `ratio` is the median `child / parent` ratio learned from the most recent `STEPS_PER_DAY` (144) paired observations by `_build_peer_ratios`. For sub-meters whose parent is intact in the gap window this usually gives the best shape, because both meters see the same load profile.
 
-### 6.3.7 Peer correlation: `_fill_via_peer_correlation`
+Only fires for `Ptot_HEI_13RT` and `Ptot_HEI_5RNS` when `Ptot_HEI` has at least one non-NaN value within the gap.
 
-Emits `PEER_CORRELATION`. Flag 2.
+### 6.3.8 MICE — `_fill_with_mice`
 
-Applies `child = parent × ratio`, where `ratio` was learned in `_build_peer_ratios` from historical `(child, parent)` pairs. For sub-meters whose parent is intact in the gap window, this is usually the best shape, because both meters see the same load.
+Emits `MICE`.
 
-Only triggered for sub-meter tiers (`Ptot_HEI_13RT`, `Ptot_HEI_5RNS`) when the parent column (`Ptot_HEI`) has at least one non-NaN value across the gap.
+Multiple Imputation by Chained Equations via `sklearn.impute.IterativeImputer`. Iteratively predicts missing values from the other site columns and recent history; runs for 3 iterations by default. First choice in the ML cascade for long gaps on non-entry meters.
 
-### 6.3.8 MICE: `_fill_with_mice`
+### 6.3.9 Kalman filter — `_fill_with_kalman_filter`
 
-Emits `MICE`. Flag 3.
+Emits `KALMAN_FILTER`.
 
-Multiple Imputation by Chained Equations. Iteratively predicts the missing values from the other site columns and recent history. Runs for a fixed 3 iterations by default.
+State-space smoothing via `pykalman.KalmanFilter`. Falls back to `pandas.Series.interpolate(method='linear')` if `pykalman` is not installed. Second choice in the ML cascade.
 
-First choice in the ML cascade for long gaps on non-entry meters.
+### 6.3.10 KNN context — `_fill_with_knn_context`
 
-### 6.3.9 Kalman filter: `_fill_with_kalman_filter`
+Emits `KNN_CONTEXT`.
 
-Emits `KALMAN_FILTER`. Flag 3.
+`sklearn.neighbors.NearestNeighbors` (default `k=5`) over the other site columns as a feature vector. Disabled by default (`use_knn=False`) because MICE and Kalman cover most cases; kept as a third-line ML fallback.
 
-State-space smoothing via `pykalman`. Used as the second ML-cascade fallback when MICE fails.
+### 6.3.11 Multi-week template — `_fill_with_multi_week_template`
 
-### 6.3.10 KNN context: `_fill_with_knn_context`
+Emits `MULTI_WEEK_TEMPLATE`.
 
-Emits `KNN_CONTEXT`. Flag 3.
+The 28-day adaptive weighted template. For each `(day-of-week, hour)` cell in the gap, looks up the blended median from `_build_weekly_templates`, which weights recent observations at `adaptive_template_bias` (default 0.7) and historical observations at `1 - adaptive_template_bias`. Falls back to `HOURLY_MEDIAN_FALLBACK` for cells with no template data.
 
-`sklearn.neighbors.NearestNeighbors` over a feature-engineered context window (day-of-week, hour, occupancy, temperature). Default `k=5`.
+Primarily invoked by `_fill_chunked_gap` for very long gaps split into chunks. The chunked approach means each chunk is filled fresh from the template without accumulating error from previous chunks.
 
-Disabled by default in `imputer.py` (`use_knn=False`) because MICE and Kalman cover most cases; KNN is kept as a third-line fallback.
-
-### 6.3.11 Multi-week template: `_fill_with_multi_week_template`
-
-Emits `MULTI_WEEK_TEMPLATE`. Flag 3.
-
-The donor-day ensemble. Walks the 56-day (`_PREPEND_DAYS`) history, finds days similar to the gap day by `(day-of-week, thermal regime, occupancy)`, takes a weighted mean over the donor days' shapes at the corresponding hours, and fills.
-
-Has a "more than 40 percent missing" fallback branch: if the donor-day window itself is too sparse, the method falls back to `SAFE_MEDIAN`. The 56-day prepend is what keeps this branch from kicking in on realistic outages.
-
-Primarily invoked by `_fill_chunked_gap` for very long gaps that are split into chunks.
+---
 
 ## 6.4 Anomaly detection
 
-Two IsolationForest-based scans sandwich the fill.
+Two IsolationForest-based scans bracket the fill: one before (to clean the input) and one after (to catch bad fills).
 
-### 6.4.1 Pre-fill: raw anomalies (`_detect_raw_anomalies`)
+### 6.4.1 Pre-fill: raw anomalies — `_detect_raw_anomalies`
 
-Before any gap is filled, `_detect_raw_anomalies` scans the raw input for three kinds of suspect rows. Stuck sensors are long runs of exactly-identical values that are not credible physically. Near-zero stretches are periods where a meter pegs at zero while neighbours show normal load. IsolationForest outliers are points that the detector, trained on the 56-day context, flags as implausibly far from the local distribution.
+Runs after feature engineering, before template building, so bad values do not skew medians.
 
-Flagged points are masked to NaN so they get imputed rather than propagated into templates. The report is accessible via `get_raw_anomaly_report()`.
+Three detectors run per site in sequence:
 
-### 6.4.2 Post-fill: zero-fill detection (`_detect_zero_fills`)
+**Stuck-sensor** — a run of 18 or more consecutive rows where `|val[i] − val[i−1]| < 0.01 % × site_median`. Physically, a meter frozen at the same reading for three or more hours signals a communication fault.
 
-After the main fill, `_detect_zero_fills` re-runs IsolationForest over the reconstructed series, looking for stretches that still look like disconnected-sensor zeros. Sometimes a linear fill between two near-zero boundaries produces a plausible-looking but actually-flat segment; those get re-filled via `_fill_chunked_gap` with the zero-fill correction flag, which logs them distinctly in the audit.
+**Near-zero** — a non-NaN value below 1 % of the site median during an `OccupancyType` of `work_hours` or `evening`. A meter reading near zero during a busy Tuesday afternoon is implausible. Not applied to `weekend` or `holiday` rows.
 
-The report is accessible via `get_zero_fill_report()`.
+**IsolationForest** — trained on the clean (non-stuck, non-zero) portion of the site column using a two-feature vector `[value, hour_of_day]` so the model understands that a high reading at 14:00 is normal but the same value at 03:00 is not. Contamination fraction is `zero_fill_contamination` (default 0.05). Falls back to a 3-σ z-score check if `sklearn` is unavailable.
 
-## 6.5 Boundary anchoring (`_anchor_to_boundaries`)
+All three detectors contribute to a unified anomaly mask. Contiguous flagged runs are converted to NaN and logged as individual records in `audit_log['raw_anomaly_corrections']`. The report is accessible via `get_raw_anomaly_report()`.
 
-After a template-based or ML-based strategy fills a gap, the filled segment usually has a different mean and sometimes a different shape from the surrounding real values. Without correction, a filled segment can show a visible discontinuity at its endpoints, which then propagates into the forecaster's features as a synthetic transient.
+### 6.4.2 Post-fill: zero-fill detection — `_detect_zero_fills`
 
-`_anchor_to_boundaries(df, site, gap_start, gap_end, filled_vals, tpl_fn=None)` runs after every template or ML fill. It blends the filled segment into the real values at both ends using a slope-aware offset. It computes `start_offset = real_left - filled_left` and `end_offset = real_right - filled_right`, applies a weighted, ramped blend from `start_offset` to `end_offset` across the segment so both endpoints match the neighbours exactly, and records the blend parameters (`mode`, `cap`, offsets, slope weight) into `postproc.align` in the audit log.
+After the main fill loop and NaN guard, `_detect_zero_fills` re-runs IsolationForest over every imputed region, scoring each filled value against a model trained on the pre-fill valid data. Values flagged as anomalous *and* below 1 % of the site median are suspected zero fills — for example, a linear interpolation between two near-zero boundaries that produces a plausible-looking but actually flat segment.
 
-The `--test-report` CSV's `# postproc.align mode=... cap=... start_offset_raw=... applied=... end_offset_raw=...` footer comes from this step.
+For each flagged stretch: the original filled values are logged, the region is reset to NaN, and `_intelligent_router` is called again with `zero_fill_correction=True`. The before and after values are both saved in `audit_log['zero_fill_corrections']`. The report is accessible via `get_zero_fill_report()`.
 
-## 6.6 Smoothing (`_smooth_junctions`)
+---
 
-After all gaps are filled and anchored, `_smooth_junctions` runs a Savitzky-Golay filter over the junctions between filled and real segments to remove any residual second-derivative discontinuity. This is a cosmetic pass: it does not change the mean behaviour, but it prevents the forecaster's gradient-based features from seeing a notch.
+## 6.5 Chunked gap recovery — `_fill_chunked_gap`
 
-The window length and polynomial order are hard-coded for 10-minute sampling and 7-day windows; if you change the frequency, revisit this function.
+When `use_chunked_recovery` is on and a gap exceeds `gap_chunk_size`, the gap is split into chunks rather than filled as a single unit. This prevents error from accumulating across a long, heterogeneous span.
 
-## 6.7 DST handling (`_detect_dst_events` and `_localise_timestamps`)
+With `use_smart_chunking` on (default), `_get_smart_chunks` adapts chunk boundaries to natural break points — midnight transitions and high-variance days — rather than cutting at a fixed number of steps. High-variance days are those whose within-day standard deviation exceeds 1.3× the median across all days. Chunks are capped at `gap_chunk_size × 1.5` steps.
 
-Europe/Paris switches twice a year. The imputer handles both transitions explicitly so they do not corrupt templates.
+Recommended chunk sizes by gap length:
 
-### Spring-forward (last Sunday of March, 02:00 to 03:00)
+| Gap length | `gap_chunk_size` |
+|---|---|
+| 1–4 days | 144 steps (1 full day) |
+| 5–7 days | 96 steps (~6.7 h) |
+| 8+ days | 72 steps (~5 h) |
 
-One hour of wall-clock time vanishes. On a 10-minute grid, six consecutive slots are absent. `_localise_timestamps` uses pandas `tz_localize(..., nonexistent="shift_forward")` so those vanished slots are shifted into the next valid slot rather than raising. `_detect_dst_events` scans the localised timestamps for a 70-minute jump between consecutive rows and logs it as `spring_forward` in the audit. The affected six slots show up as a structural gap and get filled normally.
+Each chunk is filled with `_fill_with_multi_week_template` when `use_multi_week_templates` is on, otherwise with `_intelligent_router`. Each chunk produces its own audit record, with `is_chunk=True` and `chunk_index` set.
 
-### Fall-back (last Sunday of October, 03:00 to 02:00)
+---
 
-One hour of wall-clock time repeats. Without care, the same `(day, hour)` cell in a weekly template would be populated from two different UTC instants. `_localise_timestamps` uses `tz_localize(..., ambiguous=False)` which keeps the first occurrence of the duplicated hour. The duplicate is then simply an extra six rows at the same local wall-clock time, which the reindex step deduplicates. `_detect_dst_events` logs the transition as `fall_back` in the audit.
+## 6.6 Confidence scoring
 
-If you move this module to a non-DST timezone, `_detect_dst_events` is safe to leave in; it simply finds nothing. If you move to a different DST-observing zone with different transition rules, the 70-minute and −50-minute thresholds in the detector still hold (one-hour shifts, 10-minute grid), but double-check the zone's actual offset changes.
+After every fill, `_calculate_confidence_with_uncertainty` produces a score in `[0.0, 1.0]` as the product of four factors:
+
+| Factor | What it captures |
+|---|---|
+| Strategy factor | Quality ceiling of the method used (MULTI_WEEK_TEMPLATE = 0.90, MICE = 0.85, down to SAFE_MEDIAN = 0.30) |
+| Gap factor | Degrades with gap length (1.0 for < 10 steps, 0.3 for ≥ 7 days) |
+| Occupancy factor | Work hours = 1.0, evening = 0.8, weekend = 0.7, holiday = 0.5 |
+| Holiday factor | 0.7 if the gap falls on a public holiday, 1.0 otherwise |
+
+Gaps scoring below 0.50 are appended to `_low_confidence_flags` and accessible via `get_low_confidence_report()`. Gaps scoring above 0.85 are considered high quality and require no manual review.
+
+---
+
+## 6.7 DST handling — `_localise_timestamps` and `_detect_dst_events`
+
+`Europe/Paris` switches twice a year. Both transitions are handled explicitly so they do not corrupt templates or produce phantom gaps.
+
+**Spring-forward** (last Sunday of March, 02:00 → 03:00) — one hour of wall-clock time vanishes, producing six missing 10-minute slots. `_localise_timestamps` uses `tz_localize(..., nonexistent='shift_forward')` to map those absent slots forward rather than raising. `_detect_dst_events` detects a ~70-minute jump between consecutive timestamps and logs the event as `spring_forward` in `detection_summary.dst_events`. The six slots appear as a structural gap and are filled normally by the main loop.
+
+**Fall-back** (last Sunday of October, 03:00 → 02:00) — one hour of wall-clock time repeats. Without handling, the same `(day, hour)` template cell would be populated from two different UTC instants. `_localise_timestamps` uses `ambiguous=False`, which keeps the first occurrence of the duplicated hour; the reindex step deduplicates the second. `_detect_dst_events` detects a negative or near-zero step and logs the event as `fall_back`.
+
+If you move the module to a non-DST timezone, `_detect_dst_events` is safe to leave in place — it will simply find nothing. For a different DST-observing zone, the 70-minute and −50-minute detection thresholds still hold for one-hour transitions on a 10-minute grid, but verify the zone's actual offset changes.
+
+---
 
 ## 6.8 Audit logging
 
-Every `impute()` call writes a structured JSON audit log to `AUDIT_LOG_DIR` (default `/io/audit_logs/` in Docker). The log has three top-level sections.
+Every `impute()` call writes a structured JSON file to `audit_logs/` (configurable via `audit_log_dir` at construction time). The filename is `imputation_audit_{run_id}.json`. The log is always written — there is no opt-out flag.
 
-Run metadata covers the run ID, start and end timestamps, input timespan, total rows, NaN counts per site, and DST events detected.
+### Structure
 
-The detection summary lists gaps found per site, sites affected, stuck-sensor detections, and IsolationForest outliers.
+**Run metadata** (`run_meta`)
+- `run_id`, `run_started_at`, `run_completed_at`
+- `timezone`, `data_range` (start / end timestamps), `total_rows`
+- `nan_counts_before` and `nan_counts_after` per site
+- `sites_with_gaps`
+- `template_lookback_days`, `adaptive_template_bias`, `gap_chunk_size`
+- `methods_enabled` — boolean flags for MICE, Kalman, KNN, multi-week templates, chunked recovery, smart chunking
 
-Per-gap records, one per gap, carry the site, the gap start and end indices, the gap size in steps, a `routing_trace` (the ordered list of routing-branch decisions like `START: size=..., tier=...`, `BRANCH: ML_CASCADE`, `TRY: MICE`, `FAIL: MICE`, ..., `SELECTED: <strategy>`), the strategy chosen, the confidence, the occupancy type, the holiday flag, the day type, `postproc.norm` (normalisation step parameters: mode, std ratio, mean ratio, scale applied), `postproc.align` (anchoring parameters: mode, cap, start and end offsets raw and applied, slope weight), and when applicable the template inputs used (template values, peer ratios, uncertainty bounds).
+**Inputs snapshot** (`inputs_snapshot`) — filled after lookups are built, before any gap is touched:
+- `peer_ratios` — learned `child / parent` ratio per sub-meter
+- `uncertainty_bounds` — `(lower, upper)` per site
+- `peer_correlations` — pairwise Pearson correlations across all site pairs
 
-The run summary records total gaps, methods used, mean confidence, and zero-fill corrections applied.
+**Detection summary** (`detection_summary`):
+- `gaps_found_per_site` — count of gap groups per site
+- `total_missing_steps` — aggregate NaN count before filling
+- `detection_method` — always `reindex_to_10min_grid_then_isna_scan`
+- `dst_events` — list of spring-forward / fall-back events detected
 
-Accessors on the engine object cover every slice of this log. `get_audit_log()` returns the full dict, `get_run_summary()` returns just the summary section, `get_gap_log()` returns a pandas DataFrame of all per-gap records, and `get_strategy_log()` returns a DataFrame of `(site, gap_start, gap_end, gap_size, strategy, confidence, day_type, occupancy_type, is_holiday)`. The last is the table reprojected by `imputer.py` to produce the per-point quality flags. `get_zero_fill_report()`, `get_raw_anomaly_report()`, and `get_low_confidence_report()` are focused views for specific inspections.
+**Per-gap records** (`gaps`) — one entry per gap (or chunk, when chunked recovery is active):
+- `site`, `gap_start_index`, `gap_end_index`, `gap_size_steps`, `gap_size_minutes`
+- `first_missing_timestamp`, `last_missing_timestamp`, `missing_timestamps` (full list)
+- `missing_dates`, `missing_day_names`, `unique_days_in_gap`, `missing_hours`
+- `occupancy_types`, `is_holiday_flags` — per-step arrays
+- `method` — strategy name
+- `confidence` — score in `[0.0, 1.0]`
+- `is_chunk`, `chunk_index`
+- `zero_fill_corrected` — `true` if this record was produced by a zero-fill re-impute pass
+- `routing_trace` — ordered list of every branch decision, e.g. `START: size=288, tier=sub`, `BRANCH: ML_CASCADE`, `TRY: MICE`, `FAIL: MICE`, `SELECTED: KALMAN_FILTER (confidence=0.612)`
+- `inputs_used` — template values (`median`, `std`, `recent_count`, `historical_count`) per `(day, hour)` cell, peer ratio if applicable, and uncertainty bounds
 
-For replaying an audit from a past run, load the JSON, take the `per_gap_records` list, and filter to the gap of interest. The `routing_trace` is complete: it lists every branch considered and tells you why the final one was picked.
+**Anomaly corrections**:
+- `raw_anomaly_corrections` — one record per contiguous pre-fill anomalous run: site, timestamps, original values, detection reason (`stuck_sensor`, `near_zero`, `isolation_forest_outlier`)
+- `zero_fill_corrections` — one record per post-fill correction: site, timestamps, original filled values, new filled values, detection method
+
+**Run summary** (`run_summary`):
+- `total_gaps_processed`, `total_sites_affected`
+- `methods_used` — ordered unique list of strategies applied
+- `mean_confidence`, `min_confidence`
+- `low_confidence_gap_count` — gaps scoring below 0.50
+- `raw_anomaly_corrections_count`, `zero_fill_corrections_count`, `dst_events_count`
+- `nan_counts_after` — post-fill NaN count per site (should be all zeros on a clean run)
+
+### Accessors
+
+| Method | Returns |
+|---|---|
+| `get_audit_log()` | Full audit dict from the most recent run |
+| `get_run_summary()` | Flat run-level summary dict |
+| `get_gap_log()` | DataFrame, one row per imputed gap |
+| `get_strategy_log()` | DataFrame of `(site, gap_start, gap_end, gap_size, strategy, confidence, day_type, occupancy_type, is_holiday)` |
+| `get_low_confidence_report()` | DataFrame of gaps scoring below 0.50 |
+| `get_zero_fill_report()` | DataFrame of post-fill zero-fill corrections |
+| `get_raw_anomaly_report()` | DataFrame of pre-fill anomaly runs |
+
+### Replaying an audit
+
+Load the JSON, take the `gaps` list, and filter to the gap of interest. The `routing_trace` is exhaustive — it records every branch considered and the reason the final strategy was selected. To re-run the fill for a specific gap, reconstruct the inputs from `inputs_used` and replay the method named in `method`.
+
+### Template persistence
+
+Templates can be saved and reloaded independently of an `impute()` call:
+
+```python
+algo.save_templates('templates_2026Q2.pkl')   # saves after a run
+algo.load_templates('templates_2026Q2.pkl')   # restores before the next run
+```
+
+Saved artefacts: `_weekly_templates`, `_day_variance`, `_seasonal_templates`, `_peer_ratios`, `_multi_site_correlations`, `_uncertainty_bounds`.
